@@ -9,9 +9,8 @@
     "apiKey": "AI Key"
   },
   "modal": {
-    "apiKeyTitle": "AI Model API Key",
-    "apiKeyPlaceholder": "Enter your selected provider API key",
-    "modelLabel": "Model",
+    "apiKeyTitle": "DeepSeek API Key",
+    "apiKeyPlaceholder": "Enter your DeepSeek API key",
     "save": "Save",
     "cancel": "Cancel",
     "deleteKey": "Delete Key",
@@ -30,7 +29,7 @@
     "targetLanguage": "Target language",
     "moreLanguagesSoon": "This list is extensible. The MVP starts with Spanish.",
     "mode": "Translation mode",
-    "previewMode": "MVP (~9000 characters)",
+    "previewMode": "MVP (5 pages)",
     "fullMode": "Full book",
     "fullModeDisabled": "Full-book mode is disabled in this MVP demo.",
     "pickInput": "Open EPUB file",

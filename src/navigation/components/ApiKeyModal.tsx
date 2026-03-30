@@ -3,12 +3,6 @@ import { useTranslation } from "react-i18next";
 import { load } from "@tauri-apps/plugin-store";
 import { invoke } from "@tauri-apps/api/core";
 
-const DEFAULT_AI_MODEL = "deepseek-chat";
-const MODEL_OPTIONS = [
-  { value: "deepseek-chat", label: "DeepSeek Chat" },
-  { value: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash Lite" },
-];
-
 export function ApiKeyModal({
   isOpen,
   onClose,
@@ -20,7 +14,6 @@ export function ApiKeyModal({
 }) {
   const { t } = useTranslation();
   const [apiKey, setApiKey] = useState("");
-  const [model, setModel] = useState(DEFAULT_AI_MODEL);
   const [isValidating, setIsValidating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -33,14 +26,10 @@ export function ApiKeyModal({
   const loadStore = async () => {
     try {
       const store = await load(".config.dat");
-      const legacyDeepseekKey: string | null | undefined = await store.get("deepseek_api_key");
-      const savedKey: string | null | undefined =
-        (await store.get("ai_api_key")) ?? legacyDeepseekKey;
-      const savedModel: string | null | undefined = await store.get("ai_model");
+      const savedKey: string | null | undefined = await store.get("deepseek_api_key");
       if (savedKey) {
         setApiKey(savedKey);
       }
-      setModel(savedModel || (legacyDeepseekKey ? "deepseek-chat" : DEFAULT_AI_MODEL));
     } catch (err) {
       console.error("Failed to load store", err);
     }
@@ -55,17 +44,10 @@ export function ApiKeyModal({
     setError(null);
 
     try {
-      const isValid = await invoke("validate_api_key", {
-        request: {
-          apiKey,
-          model,
-        },
-      });
+      const isValid = await invoke("validate_api_key", { apiKey });
       if (isValid) {
         const store = await load(".config.dat");
-        await store.set("ai_api_key", apiKey);
-        await store.set("ai_model", model);
-        await store.delete("deepseek_api_key");
+        await store.set("deepseek_api_key", apiKey);
         await store.save();
         onApiKeyChanged?.();
         onClose();
@@ -82,12 +64,9 @@ export function ApiKeyModal({
   const handleDelete = async () => {
     try {
       const store = await load(".config.dat");
-      await store.delete("ai_api_key");
-      await store.delete("ai_model");
       await store.delete("deepseek_api_key");
       await store.save();
       setApiKey("");
-      setModel(DEFAULT_AI_MODEL);
       onApiKeyChanged?.();
       onClose();
     } catch (err) {
@@ -103,22 +82,6 @@ export function ApiKeyModal({
         <h2 className="text-xl font-bold mb-4 text-slate-900">
           {t("modal.apiKeyTitle")}
         </h2>
-        <label className="text-sm font-medium text-slate-700 mb-2 block" htmlFor="ai-model-select">
-          {t("modal.modelLabel")}
-        </label>
-        <select
-          id="ai-model-select"
-          className="w-full p-2 border border-slate-300 rounded mb-3 focus:outline-none focus:ring-2 focus:ring-blue-500 text-slate-900 bg-white"
-          value={model}
-          onChange={(e) => setModel(e.target.value)}
-          disabled={isValidating}
-        >
-          {MODEL_OPTIONS.map((option) => (
-            <option key={option.value} value={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </select>
         <input
           type="password"
           className="w-full p-2 border border-slate-300 rounded mb-4 focus:outline-none focus:ring-2 focus:ring-blue-500 text-slate-900"
