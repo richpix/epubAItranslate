@@ -1,0 +1,52 @@
+{
+  "sidebar": {
+    "title": "Epub Translator",
+    "library": "Biblioteca",
+    "translate": "Traducir",
+    "settings": "Ajustes",
+    "toggle": "Alternar Menú",
+    "switchLanguage": "Cambiar Idioma",
+    "apiKey": "Clave IA"
+  },
+  "modal": {
+    "apiKeyTitle": "Clave API de DeepSeek",
+    "apiKeyPlaceholder": "Introduce tu clave API de DeepSeek",
+    "save": "Guardar",
+    "cancel": "Cancelar",
+    "deleteKey": "Eliminar Clave",
+    "errorEmpty": "La clave API no puede estar vacía",
+    "errorInvalid": "La API key no es valida",
+    "validating": "Validando..."
+  },
+  "home": {
+    "title": "Bienvenido a Traductor de Epub, Valentina",
+    "description": "Traduce tus libros epub de manera facil con IA",
+    "content": "El layout responsive está listo. Intenta reducir el ancho de la ventana para ver cómo el Sidebar colapsa o solo muestra íconos interactivos."
+  },
+  "translation": {
+    "title": "Traducir EPUB",
+    "description": "Selecciona un .epub, elige idioma y exporta el archivo traducido.",
+    "targetLanguage": "Idioma de destino",
+    "moreLanguagesSoon": "La lista es extensible. Por ahora el MVP usa Español.",
+    "mode": "Modo de traducción",
+    "previewMode": "MVP (5 páginas)",
+    "fullMode": "Libro completo",
+    "fullModeDisabled": "Modo libro completo deshabilitado para esta demo MVP.",
+    "pickInput": "Abrir archivo EPUB",
+    "pickOutput": "Guardar como",
+    "addApiKey": "Configurar API Key",
+    "inputPath": "Entrada",
+    "outputPath": "Salida",
+    "noneSelected": "Sin seleccionar",
+    "start": "Iniciar traducción",
+    "translating": "Traduciendo...",
+    "progress": "Progreso",
+    "translatedChars": "Caracteres traducidos",
+    "success": "Traducción finalizada. Archivo: {{outputPath}} ({{translatedFiles}}/{{totalFiles}} capítulos HTML)",
+    "errors": {
+      "noApiKey": "Debes configurar una API Key válida para traducir.",
+      "noInput": "Selecciona un archivo EPUB de entrada.",
+      "noOutput": "Selecciona la ruta de salida para el EPUB traducido."
+    }
+  }
+}

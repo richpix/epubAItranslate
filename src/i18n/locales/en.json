@@ -1,0 +1,52 @@
+{
+  "sidebar": {
+    "title": "Epub Translator",
+    "library": "Library",
+    "translate": "Translate",
+    "settings": "Settings",
+    "toggle": "Toggle Sidebar",
+    "switchLanguage": "Switch Language",
+    "apiKey": "AI Key"
+  },
+  "modal": {
+    "apiKeyTitle": "DeepSeek API Key",
+    "apiKeyPlaceholder": "Enter your DeepSeek API key",
+    "save": "Save",
+    "cancel": "Cancel",
+    "deleteKey": "Delete Key",
+    "errorEmpty": "API Key cannot be empty",
+    "errorInvalid": "API key is not valid",
+    "validating": "Validating..."
+  },
+  "home": {
+    "title": "Welcome to Epub Translator, Valentina",
+    "description": "Easily translate your epub books with AI",
+    "content": "The responsive layout is ready. Try reducing the window width to see how the Sidebar collapses or only shows interactive icons."
+  },
+  "translation": {
+    "title": "Translate EPUB",
+    "description": "Pick a .epub file, choose a language, and export the translated file.",
+    "targetLanguage": "Target language",
+    "moreLanguagesSoon": "This list is extensible. The MVP starts with Spanish.",
+    "mode": "Translation mode",
+    "previewMode": "MVP (5 pages)",
+    "fullMode": "Full book",
+    "fullModeDisabled": "Full-book mode is disabled in this MVP demo.",
+    "pickInput": "Open EPUB file",
+    "pickOutput": "Save as",
+    "addApiKey": "Set API key",
+    "inputPath": "Input",
+    "outputPath": "Output",
+    "noneSelected": "Not selected",
+    "start": "Start translation",
+    "translating": "Translating...",
+    "progress": "Progress",
+    "translatedChars": "Translated characters",
+    "success": "Translation completed. File: {{outputPath}} ({{translatedFiles}}/{{totalFiles}} HTML chapters)",
+    "errors": {
+      "noApiKey": "You must configure a valid API key before translating.",
+      "noInput": "Select an input EPUB file.",
+      "noOutput": "Select the output path for the translated EPUB."
+    }
+  }
+}
