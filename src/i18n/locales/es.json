@@ -9,8 +9,9 @@
     "apiKey": "Clave IA"
   },
   "modal": {
-    "apiKeyTitle": "Clave API de DeepSeek",
-    "apiKeyPlaceholder": "Introduce tu clave API de DeepSeek",
+    "apiKeyTitle": "Clave API del modelo IA",
+    "apiKeyPlaceholder": "Introduce tu clave API del proveedor seleccionado",
+    "modelLabel": "Modelo",
     "save": "Guardar",
     "cancel": "Cancelar",
     "deleteKey": "Eliminar Clave",
@@ -29,7 +30,7 @@
     "targetLanguage": "Idioma de destino",
     "moreLanguagesSoon": "La lista es extensible. Por ahora el MVP usa Español.",
     "mode": "Modo de traducción",
-    "previewMode": "MVP (5 páginas)",
+    "previewMode": "MVP (~9000 caracteres)",
     "fullMode": "Libro completo",
     "fullModeDisabled": "Modo libro completo deshabilitado para esta demo MVP.",
     "pickInput": "Abrir archivo EPUB",

@@ -40,10 +40,12 @@ function defaultOutputPath(inputPath: string, lang: string): string {
 
 export function TranslationPanel({
   apiKey,
+  aiModel,
   hasApiKey,
   onOpenApiKey,
 }: {
   apiKey: string | null;
+  aiModel: string;
   hasApiKey: boolean;
   onOpenApiKey: () => void;
 }) {
@@ -138,6 +140,7 @@ export function TranslationPanel({
           previewOnly,
           previewPages: 5,
           apiKey: apiKey ?? "",
+          model: aiModel,
         },
       });
 

@@ -6,10 +6,13 @@ import { ApiKeyModal } from "./navigation/components/ApiKeyModal";
 import { TranslationPanel } from "./components/TranslationPanel";
 import "./App.css";
 
+const DEFAULT_AI_MODEL = "deepseek-chat";
+
 function App() {
   const { t } = useTranslation();
   const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState(false);
   const [apiKey, setApiKey] = useState<string | null>(null);
+  const [aiModel, setAiModel] = useState(DEFAULT_AI_MODEL);
 
   useEffect(() => {
     void loadApiKey();
@@ -18,11 +21,16 @@ function App() {
   const loadApiKey = async () => {
     try {
       const store = await load(".config.dat");
-      const savedKey: string | null | undefined = await store.get("deepseek_api_key");
+      const legacyDeepseekKey: string | null | undefined = await store.get("deepseek_api_key");
+      const savedKey: string | null | undefined =
+        (await store.get("ai_api_key")) ?? legacyDeepseekKey;
+      const savedModel: string | null | undefined = await store.get("ai_model");
       setApiKey(savedKey ?? null);
+      setAiModel(savedModel ?? (legacyDeepseekKey ? "deepseek-chat" : DEFAULT_AI_MODEL));
     } catch (error) {
       console.error("Failed to load API key", error);
       setApiKey(null);
+      setAiModel(DEFAULT_AI_MODEL);
     }
   };
 
@@ -37,6 +45,7 @@ function App() {
         <div className="p-8">
           <TranslationPanel
             apiKey={apiKey}
+            aiModel={aiModel}
             hasApiKey={Boolean(apiKey)}
             onOpenApiKey={() => setIsApiKeyModalOpen(true)}
           />
