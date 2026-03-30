@@ -1,10 +1,12 @@
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
 
+use quick_xml::events::Event;
+use quick_xml::reader::Reader;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
-use zip::write::FileOptions;
 use zip::{ZipArchive, ZipWriter};
 
 use crate::ai;
@@ -86,17 +88,23 @@ pub async fn translate_epub(
     )
     .map_err(|e| format!("EPUB invalido: {}", e))?;
 
-    let total_files = reader.len();
-    let html_entry_indexes = (0..total_files)
-        .filter_map(|i| {
-            reader
-                .by_index(i)
-                .ok()
-                .and_then(|entry| is_html_path(entry.name()).then_some(i))
-        })
-        .collect::<Vec<_>>();
+    let reading_order_paths = match get_epub_reading_order(&mut reader) {
+        Ok(paths) => paths,
+        Err(e) => {
+            println!("Warning: Could not get reading order: {}", e);
+            let total_files = reader.len();
+            (0..total_files)
+                .filter_map(|i| {
+                    reader
+                        .by_index(i)
+                        .ok()
+                        .and_then(|entry| is_html_path(entry.name()).then(|| entry.name().to_string()))
+                })
+                .collect::<Vec<_>>()
+        }
+    };
 
-    let total_html_files = html_entry_indexes.len();
+    let total_html_files = reading_order_paths.len();
 
     emit_progress(
         &app,
@@ -124,48 +132,40 @@ pub async fn translate_epub(
 
     let mut translated_html_files = 0usize;
     let mut translated_characters = 0usize;
+    let mut processed_paths = HashSet::new();
 
-    for index in 0..total_files {
-        let (file_name, options, is_directory, bytes) = {
-            let mut entry = reader
-                .by_index(index)
-                .map_err(|e| format!("No se pudo leer la entrada EPUB {index}: {e}"))?;
+    // Fase 1: Procesar en el orden de lectura
+    for file_name in &reading_order_paths {
+        let (options, bytes) = {
+            let mut entry = match reader.by_name(file_name) {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
 
-            let file_name = entry.name().to_string();
-            let mut options = FileOptions::default().compression_method(entry.compression());
+            let mut options = zip::write::FileOptions::default().compression_method(entry.compression());
             if let Some(mode) = entry.unix_mode() {
                 options = options.unix_permissions(mode);
             }
 
-            if entry.is_dir() {
-                (file_name, options, true, Vec::new())
-            } else {
-                let mut bytes = Vec::new();
-                entry
-                    .read_to_end(&mut bytes)
-                    .map_err(|e| format!("No se pudieron leer bytes de entrada: {}", e))?;
-                (file_name, options, false, bytes)
+            let mut bytes = Vec::new();
+            if let Err(e) = entry.read_to_end(&mut bytes) {
+                println!("Error al leer entrada del epub {}: {}", file_name, e);
+                continue;
             }
+            (options, bytes)
         };
 
-        if is_directory {
-            writer
-                .add_directory(file_name.as_str(), options)
-                .map_err(|e| format!("No se pudo escribir directorio en salida: {}", e))?;
-            continue;
-        }
-
-        if is_html_path(&file_name) {
-            let source_html = match String::from_utf8(bytes) {
+        if is_html_path(file_name) {
+            let source_html = match String::from_utf8(bytes.clone()) {
                 Ok(content) => content,
                 Err(err) => {
-                    let original_bytes = err.into_bytes();
                     writer
                         .start_file(file_name.as_str(), options)
-                        .map_err(|e| format!("No se pudo crear entrada de archivo en salida: {}", e))?;
+                        .map_err(|e| format!("No se pudo crear entrada: {}", e))?;
                     writer
-                        .write_all(&original_bytes)
-                        .map_err(|e| format!("No se pudo escribir entrada sin traducir: {}", e))?;
+                        .write_all(&err.into_bytes())
+                        .map_err(|e| format!("Error en ZIP: {}", e))?;
+                    processed_paths.insert(file_name.clone());
                     continue;
                 }
             };
@@ -198,11 +198,10 @@ pub async fn translate_epub(
                 .write_all(translated_html.as_bytes())
                 .map_err(|e| format!("No se pudo escribir entrada traducida: {}", e))?;
 
-            let current_html_index = translated_html_files;
             let percent = if total_html_files == 0 {
                 100.0
             } else {
-                (current_html_index as f32 / total_html_files as f32) * 100.0
+                (translated_html_files as f32 / total_html_files as f32) * 100.0
             };
 
             emit_progress(
@@ -210,7 +209,7 @@ pub async fn translate_epub(
                 TranslationProgressPayload {
                     status: "processing".to_string(),
                     message: format!("Traduciendo {}", file_name),
-                    current_file: current_html_index,
+                    current_file: translated_html_files,
                     total_files: total_html_files,
                     percent,
                     translated_characters,
@@ -219,10 +218,50 @@ pub async fn translate_epub(
         } else {
             writer
                 .start_file(file_name.as_str(), options)
-                .map_err(|e| format!("No se pudo crear entrada de copia directa: {}", e))?;
+                .map_err(|e| format!("No se pudo crear entrada: {}", e))?;
             writer
                 .write_all(&bytes)
-                .map_err(|e| format!("No se pudo escribir entrada de copia directa: {}", e))?;
+                .map_err(|e| format!("Error escribiendo en ZIP: {}", e))?;
+        }
+        processed_paths.insert(file_name.clone());
+    }
+
+    // Fase 2: Copiar el resto de los archivos (imagenes, css, y archivos no listados en el spine)
+    let total_files = reader.len();
+    for index in 0..total_files {
+        let (file_name, options, is_directory, bytes) = {
+            let mut entry = match reader.by_index(index) {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+
+            let name = entry.name().to_string();
+            if processed_paths.contains(&name) {
+                continue;
+            }
+
+            let mut options = zip::write::FileOptions::default().compression_method(entry.compression());
+            if let Some(mode) = entry.unix_mode() {
+                options = options.unix_permissions(mode);
+            }
+
+            if entry.is_dir() {
+                (name, options, true, Vec::new())
+            } else {
+                let mut bytes = Vec::new();
+                if let Err(_) = entry.read_to_end(&mut bytes) {
+                    continue;
+                }
+                (name, options, false, bytes)
+            }
+        };
+
+        if is_directory {
+            let _ = writer.add_directory(file_name.as_str(), options);
+        } else {
+            if let Ok(()) = writer.start_file(file_name.as_str(), options) {
+                let _ = writer.write_all(&bytes);
+            }
         }
     }
 
@@ -249,6 +288,127 @@ pub async fn translate_epub(
         translated_characters,
         preview_only: request.preview_only,
     })
+}
+
+fn get_epub_reading_order(archive: &mut ZipArchive<File>) -> Result<Vec<String>, String> {
+    let mut file = archive
+        .by_name("META-INF/container.xml")
+        .map_err(|e| format!("No se pudo leer META-INF/container.xml: {}", e))?;
+    let mut xml = String::new();
+    file.read_to_string(&mut xml)
+        .map_err(|e| format!("Error leyendo container.xml: {}", e))?;
+    drop(file);
+
+    let mut reader = Reader::from_str(&xml);
+    let mut rootfile_path = None;
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) => {
+                if e.name().as_ref() == b"rootfile" {
+                    for attr in e.attributes() {
+                        if let Ok(a) = attr {
+                            if a.key.as_ref() == b"full-path" {
+                                rootfile_path = String::from_utf8(a.value.into_owned()).ok();
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => (),
+        }
+    }
+
+    let rootfile_path = rootfile_path.ok_or_else(|| "No se encontro <rootfile>".to_string())?;
+
+    let mut opf_file = archive
+        .by_name(&rootfile_path)
+        .map_err(|e| format!("No se encontro archivo OPF: {}", e))?;
+    let mut opf_xml = String::new();
+    opf_file
+        .read_to_string(&mut opf_xml)
+        .map_err(|e| format!("Error leyendo OPF: {}", e))?;
+    drop(opf_file);
+
+    let base_path = match rootfile_path.rfind('/') {
+        Some(idx) => &rootfile_path[..idx + 1],
+        None => "",
+    };
+
+    let mut parser = Reader::from_str(&opf_xml);
+    let mut buf = Vec::new();
+
+    let mut manifest = HashMap::new();
+    let mut spine = Vec::new();
+    let mut in_spine = false;
+
+    loop {
+        match parser.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                // We must handle namespacing, e.g. `<opf:item ...>` or `<item ...>`
+                let tag_name = e.name();
+                let local_name = tag_name.into_inner();
+                // strip namespaces correctly: usually `item` is `item` but just in case
+                let is_tag = |name_bytes: &[u8], target: &[u8]| -> bool {
+                    name_bytes == target || name_bytes.ends_with(&[b':'].iter().chain(target).copied().collect::<Vec<u8>>())
+                };
+
+                if is_tag(local_name, b"item") {
+                    let mut id = None;
+                    let mut href = None;
+                    for attr in e.attributes() {
+                        if let Ok(a) = attr {
+                            if a.key.as_ref() == b"id" {
+                                id = String::from_utf8(a.value.into_owned()).ok();
+                            } else if a.key.as_ref() == b"href" {
+                                href = String::from_utf8(a.value.into_owned()).ok();
+                            }
+                        }
+                    }
+                    if let (Some(id), Some(href)) = (id, href) {
+                        manifest.insert(id, href);
+                    }
+                } else if is_tag(local_name, b"spine") {
+                    in_spine = true;
+                } else if is_tag(local_name, b"itemref") && in_spine {
+                    for attr in e.attributes() {
+                        if let Ok(a) = attr {
+                            if a.key.as_ref() == b"idref" {
+                                if let Ok(idref) = String::from_utf8(a.value.into_owned()) {
+                                    spine.push(idref);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let tag_name = e.name();
+                let local_name = tag_name.into_inner();
+                let is_tag = |name_bytes: &[u8], target: &[u8]| -> bool {
+                    name_bytes == target || name_bytes.ends_with(&[b':'].iter().chain(target).copied().collect::<Vec<u8>>())
+                };
+                if is_tag(local_name, b"spine") {
+                    in_spine = false;
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => (),
+        }
+        buf.clear();
+    }
+
+    let mut reading_order = Vec::new();
+    for idref in spine {
+        if let Some(href) = manifest.get(&idref) {
+            let full_path = format!("{}{}", base_path, href);
+            reading_order.push(full_path);
+        }
+    }
+
+    Ok(reading_order)
 }
 
 fn is_html_path(path: &str) -> bool {
