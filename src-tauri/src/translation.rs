@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use reqwest::Client;
@@ -12,7 +13,16 @@ use zip::{ZipArchive, ZipWriter};
 use crate::ai;
 
 const APPROX_CHARS_PER_PAGE: usize = 1800;
+const APPROX_CHARS_PER_TOKEN: usize = 4;
 const DEFAULT_PREVIEW_PAGES: usize = 5;
+const CHAPTER_TOKEN_THRESHOLD: usize = 10_000;
+const CHUNK_MIN_CHARS: usize = 2_000;
+const CHUNK_TARGET_CHARS: usize = 3_000;
+const CHUNK_MAX_CHARS: usize = 4_000;
+const FULL_HTML_BLOCK_MIN_CHARS: usize = 8_000;
+const FULL_HTML_BLOCK_TARGET_CHARS: usize = 12_000;
+const FULL_HTML_BLOCK_MAX_CHARS: usize = 18_000;
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 3;
 const MAX_RETRIES: u32 = 4;
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +69,67 @@ struct HtmlToken {
     value: String,
 }
 
+#[derive(Clone, Copy)]
+struct TranslationChunkOptions {
+    enable_chunking: bool,
+    chunk_threshold_chars: usize,
+    chunk_min_chars: usize,
+    chunk_target_chars: usize,
+    max_chunk_chars: usize,
+    enable_streaming: bool,
+    max_concurrent_requests: usize,
+    dynamic_rate_limit: bool,
+}
+
+#[derive(Clone, Copy)]
+struct EntryMeta {
+    compression: zip::CompressionMethod,
+    unix_mode: Option<u32>,
+}
+
+enum SpineEntryContent {
+    Html(String),
+    Raw(Vec<u8>),
+}
+
+struct SpineEntry {
+    file_name: String,
+    meta: EntryMeta,
+    content: SpineEntryContent,
+}
+
+struct ProgressReporter {
+    app: tauri::AppHandle,
+    file_name: String,
+    current_file: usize,
+    total_files: usize,
+    completed_files: usize,
+    base_translated_chars: usize,
+}
+
+impl ProgressReporter {
+    fn emit(&self, consumed_chars: usize, file_fraction: f32, message: &str) {
+        let percent = if self.total_files == 0 {
+            100.0
+        } else {
+            let fraction = file_fraction.clamp(0.0, 1.0);
+            ((self.completed_files as f32 + fraction) / self.total_files as f32) * 100.0
+        };
+
+        emit_progress(
+            &self.app,
+            TranslationProgressPayload {
+                status: "processing".to_string(),
+                message: message.to_string(),
+                current_file: self.current_file,
+                total_files: self.total_files,
+                percent,
+                translated_characters: self.base_translated_chars + consumed_chars,
+            },
+        );
+    }
+}
+
 #[tauri::command]
 pub async fn translate_epub(
     app: tauri::AppHandle,
@@ -73,10 +144,6 @@ pub async fn translate_epub(
 
     if request.api_key.trim().is_empty() {
         return Err("La API key de DeepSeek es obligatoria".to_string());
-    }
-
-    if !request.preview_only {
-        return Err("La traduccion de libro completo esta deshabilitada en este MVP".to_string());
     }
 
     if !input_path.to_lowercase().ends_with(".epub") {
@@ -104,7 +171,83 @@ pub async fn translate_epub(
         }
     };
 
-    let total_html_files = reading_order_paths.len();
+    let output_file = File::create(output_path)
+        .map_err(|e| format!("No se pudo crear el EPUB de salida: {}", e))?;
+    let mut writer = ZipWriter::new(output_file);
+    let client = Client::builder()
+        .pool_max_idle_per_host(64)
+        .tcp_nodelay(true)
+        .build()
+        .map_err(|e| format!("No se pudo inicializar cliente HTTP: {}", e))?;
+
+    let preview_pages = request
+        .preview_pages
+        .map(|value| value as usize)
+        .unwrap_or(DEFAULT_PREVIEW_PAGES)
+        .max(1);
+    let preview_limit = preview_pages * APPROX_CHARS_PER_PAGE;
+
+    let chunk_options = TranslationChunkOptions {
+        enable_chunking: !request.preview_only,
+        chunk_threshold_chars: CHAPTER_TOKEN_THRESHOLD * APPROX_CHARS_PER_TOKEN,
+        chunk_min_chars: CHUNK_MIN_CHARS,
+        chunk_target_chars: CHUNK_TARGET_CHARS,
+        max_chunk_chars: CHUNK_MAX_CHARS,
+        enable_streaming: request.preview_only,
+        max_concurrent_requests: if request.preview_only {
+            1
+        } else {
+            DEFAULT_MAX_CONCURRENT_REQUESTS
+        },
+        dynamic_rate_limit: !request.preview_only,
+    };
+
+    let mut translated_html_files = 0usize;
+    let mut translated_characters = 0usize;
+    let mut processed_paths = HashSet::new();
+    let mut spine_entries = Vec::new();
+
+    for file_name in &reading_order_paths {
+        let (meta, bytes) = {
+            let mut entry = match reader.by_name(file_name) {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+
+            let meta = EntryMeta {
+                compression: entry.compression(),
+                unix_mode: entry.unix_mode(),
+            };
+
+            let mut bytes = Vec::new();
+            if let Err(e) = entry.read_to_end(&mut bytes) {
+                println!("Error al leer entrada del epub {}: {}", file_name, e);
+                continue;
+            }
+            (meta, bytes)
+        };
+
+        let content = if is_html_path(file_name) {
+            match String::from_utf8(bytes) {
+                Ok(source_html) => SpineEntryContent::Html(source_html),
+                Err(err) => SpineEntryContent::Raw(err.into_bytes()),
+            }
+        } else {
+            SpineEntryContent::Raw(bytes)
+        };
+
+        spine_entries.push(SpineEntry {
+            file_name: file_name.clone(),
+            meta,
+            content,
+        });
+        processed_paths.insert(file_name.clone());
+    }
+
+    let total_html_files = spine_entries
+        .iter()
+        .filter(|entry| matches!(entry.content, SpineEntryContent::Html(_)))
+        .count();
 
     emit_progress(
         &app,
@@ -118,112 +261,253 @@ pub async fn translate_epub(
         },
     );
 
-    let output_file = File::create(output_path)
-        .map_err(|e| format!("No se pudo crear el EPUB de salida: {}", e))?;
-    let mut writer = ZipWriter::new(output_file);
-    let client = Client::new();
+    if request.preview_only {
+        for entry in &spine_entries {
+            let file_options = build_file_options(entry.meta);
+            match &entry.content {
+                SpineEntryContent::Html(source_html) => {
+                    let should_translate = translated_characters < preview_limit;
+                    let (translated_html, consumed_chars) = if should_translate {
+                        let reporter = ProgressReporter {
+                            app: app.clone(),
+                            file_name: entry.file_name.clone(),
+                            current_file: translated_html_files + 1,
+                            total_files: total_html_files,
+                            completed_files: translated_html_files,
+                            base_translated_chars: translated_characters,
+                        };
 
-    let preview_pages = request
-        .preview_pages
-        .map(|value| value as usize)
-        .unwrap_or(DEFAULT_PREVIEW_PAGES)
-        .max(1);
-    let preview_limit = preview_pages * APPROX_CHARS_PER_PAGE;
+                        translate_html_content(
+                            &client,
+                            request.api_key.trim(),
+                            language_label(&request.target_language),
+                            source_html,
+                            Some(preview_limit.saturating_sub(translated_characters)),
+                            &chunk_options,
+                            Some(&reporter),
+                        )
+                        .await?
+                    } else {
+                        (source_html.clone(), 0)
+                    };
 
-    let mut translated_html_files = 0usize;
-    let mut translated_characters = 0usize;
-    let mut processed_paths = HashSet::new();
+                    translated_characters += consumed_chars;
+                    translated_html_files += 1;
 
-    // Fase 1: Procesar en el orden de lectura
-    for file_name in &reading_order_paths {
-        let (options, bytes) = {
-            let mut entry = match reader.by_name(file_name) {
-                Ok(entry) => entry,
-                Err(_) => continue,
-            };
-
-            let mut options = zip::write::FileOptions::default().compression_method(entry.compression());
-            if let Some(mode) = entry.unix_mode() {
-                options = options.unix_permissions(mode);
-            }
-
-            let mut bytes = Vec::new();
-            if let Err(e) = entry.read_to_end(&mut bytes) {
-                println!("Error al leer entrada del epub {}: {}", file_name, e);
-                continue;
-            }
-            (options, bytes)
-        };
-
-        if is_html_path(file_name) {
-            let source_html = match String::from_utf8(bytes.clone()) {
-                Ok(content) => content,
-                Err(err) => {
                     writer
-                        .start_file(file_name.as_str(), options)
+                        .start_file(entry.file_name.as_str(), file_options)
+                        .map_err(|e| format!("No se pudo crear entrada de archivo en salida: {}", e))?;
+                    writer
+                        .write_all(translated_html.as_bytes())
+                        .map_err(|e| format!("No se pudo escribir entrada traducida: {}", e))?;
+
+                    let percent = if total_html_files == 0 {
+                        100.0
+                    } else {
+                        (translated_html_files as f32 / total_html_files as f32) * 100.0
+                    };
+                    emit_progress(
+                        &app,
+                        TranslationProgressPayload {
+                            status: "processing".to_string(),
+                            message: format!("Traduciendo {}", entry.file_name),
+                            current_file: translated_html_files,
+                            total_files: total_html_files,
+                            percent,
+                            translated_characters,
+                        },
+                    );
+                }
+                SpineEntryContent::Raw(bytes) => {
+                    writer
+                        .start_file(entry.file_name.as_str(), file_options)
                         .map_err(|e| format!("No se pudo crear entrada: {}", e))?;
                     writer
-                        .write_all(&err.into_bytes())
-                        .map_err(|e| format!("Error en ZIP: {}", e))?;
-                    processed_paths.insert(file_name.clone());
-                    continue;
+                        .write_all(bytes)
+                        .map_err(|e| format!("Error escribiendo en ZIP: {}", e))?;
                 }
-            };
-
-            let should_translate = !request.preview_only || translated_characters < preview_limit;
-            let (translated_html, consumed_chars) = if should_translate {
-                translate_html_content(
-                    &client,
-                    request.api_key.trim(),
-                    language_label(&request.target_language),
-                    &source_html,
-                    if request.preview_only {
-                        Some(preview_limit.saturating_sub(translated_characters))
-                    } else {
-                        None
-                    },
-                )
-                .await?
-            } else {
-                (source_html, 0)
-            };
-
-            translated_characters += consumed_chars;
-            translated_html_files += 1;
-
-            writer
-                .start_file(file_name.as_str(), options)
-                .map_err(|e| format!("No se pudo crear entrada de archivo en salida: {}", e))?;
-            writer
-                .write_all(translated_html.as_bytes())
-                .map_err(|e| format!("No se pudo escribir entrada traducida: {}", e))?;
-
-            let percent = if total_html_files == 0 {
-                100.0
-            } else {
-                (translated_html_files as f32 / total_html_files as f32) * 100.0
-            };
-
-            emit_progress(
-                &app,
-                TranslationProgressPayload {
-                    status: "processing".to_string(),
-                    message: format!("Traduciendo {}", file_name),
-                    current_file: translated_html_files,
-                    total_files: total_html_files,
-                    percent,
-                    translated_characters,
-                },
-            );
-        } else {
-            writer
-                .start_file(file_name.as_str(), options)
-                .map_err(|e| format!("No se pudo crear entrada: {}", e))?;
-            writer
-                .write_all(&bytes)
-                .map_err(|e| format!("Error escribiendo en ZIP: {}", e))?;
+            }
         }
-        processed_paths.insert(file_name.clone());
+    } else {
+        let mut html_indices = Vec::new();
+        for (idx, entry) in spine_entries.iter().enumerate() {
+            if let SpineEntryContent::Html(_) = entry.content {
+                html_indices.push(idx);
+            }
+        }
+        let html_total = html_indices.len();
+
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, String)>();
+        
+        let mut writer_local = writer;
+        let mut expected_index = 0usize;
+        let mut buffered_html: HashMap<usize, String> = HashMap::new();
+        
+        let mut original_html_contents = HashMap::new();
+        let mut original_file_names = HashMap::new();
+        for (idx, entry) in spine_entries.iter().enumerate() {
+            if let SpineEntryContent::Html(ref content) = entry.content {
+                original_html_contents.insert(idx, content.clone());
+            }
+            original_file_names.insert(idx, entry.file_name.clone());
+        }
+        
+        // Destruct the vector out of logic loop
+        let spine_entries_for_writer = std::mem::replace(&mut spine_entries, Vec::new());
+        let writer_thread = std::thread::spawn(move || -> Result<ZipWriter<File>, String> {
+            while expected_index < spine_entries_for_writer.len() {
+                let entry = &spine_entries_for_writer[expected_index];
+                let file_options = build_file_options(entry.meta);
+                
+                match &entry.content {
+                    SpineEntryContent::Raw(bytes) => {
+                        writer_local.start_file(entry.file_name.as_str(), file_options).map_err(|e| e.to_string())?;
+                        writer_local.write_all(bytes).map_err(|e| e.to_string())?;
+                        expected_index += 1;
+                    }
+                    SpineEntryContent::Html(_) => {
+                        if let Some(html) = buffered_html.remove(&expected_index) {
+                            writer_local.start_file(entry.file_name.as_str(), file_options).map_err(|e| e.to_string())?;
+                            writer_local.write_all(html.as_bytes()).map_err(|e| e.to_string())?;
+                            expected_index += 1;
+                        } else {
+                            if let Ok((idx, html)) = rx.recv() {
+                                if idx == expected_index {
+                                    writer_local.start_file(entry.file_name.as_str(), file_options).map_err(|e| e.to_string())?;
+                                    writer_local.write_all(html.as_bytes()).map_err(|e| e.to_string())?;
+                                    expected_index += 1;
+                                } else {
+                                    buffered_html.insert(idx, html);
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(writer_local)
+        });
+
+        let mut pending = VecDeque::from(html_indices);
+        let mut in_flight = FuturesUnordered::new();
+        let mut retries: HashMap<usize, u32> = HashMap::new();
+        let max_concurrency = chunk_options.max_concurrent_requests.max(1);
+        let mut active_concurrency = max_concurrency;
+        let mut success_streak = 0usize;
+
+        while !pending.is_empty() || !in_flight.is_empty() {
+            while in_flight.len() < active_concurrency && !pending.is_empty() {
+                let Some(chapter_index) = pending.pop_front() else {
+                    break;
+                };
+
+                let source_html = original_html_contents.get(&chapter_index).unwrap().clone();
+                let file_name = original_file_names.get(&chapter_index).unwrap().clone();
+                let client = client.clone();
+                let api_key = request.api_key.trim().to_string();
+                let target_language = language_label(&request.target_language).to_string();
+                let options = chunk_options;
+
+                in_flight.push(async move {
+                    let translated = translate_html_content(
+                        &client,
+                        &api_key,
+                        &target_language,
+                        &source_html,
+                        None,
+                        &options,
+                        None,
+                    )
+                    .await;
+                    (chapter_index, file_name, translated)
+                });
+            }
+
+            let Some((chapter_index, file_name, result)) = in_flight.next().await else {
+                break;
+            };
+
+            match result {
+                Ok((translated_html, consumed_chars)) => {
+                    let _ = tx.send((chapter_index, translated_html));
+                    translated_html_files += 1;
+                    translated_characters += consumed_chars;
+                    success_streak += 1;
+
+                    if chunk_options.dynamic_rate_limit
+                        && active_concurrency < max_concurrency
+                        && success_streak >= 3
+                    {
+                        active_concurrency += 1;
+                        success_streak = 0;
+                    }
+
+                    let percent = if html_total == 0 {
+                        100.0
+                    } else {
+                        (translated_html_files as f32 / html_total as f32) * 100.0
+                    };
+
+                    emit_progress(
+                        &app,
+                        TranslationProgressPayload {
+                            status: "processing".to_string(),
+                            message: format!(
+                                "Traduciendo a disco {} ({} hilos)",
+                                file_name, active_concurrency
+                            ),
+                            current_file: translated_html_files,
+                            total_files: html_total,
+                            percent,
+                            translated_characters,
+                        },
+                    );
+                }
+                Err(err) => {
+                    let retry_count = retries.get(&chapter_index).copied().unwrap_or(0);
+                    if chunk_options.dynamic_rate_limit
+                        && is_rate_limit_error(&err)
+                        && retry_count < MAX_RETRIES
+                    {
+                        retries.insert(chapter_index, retry_count + 1);
+                        pending.push_back(chapter_index);
+                        success_streak = 0;
+                        if active_concurrency > 1 {
+                            active_concurrency -= 1;
+                        }
+
+                        let backoff_secs = 2u64.pow(retry_count as u32);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+
+                        emit_progress(
+                            &app,
+                            TranslationProgressPayload {
+                                status: "processing".to_string(),
+                                message: format!(
+                                    "Rate limit, esperando {}s",
+                                    backoff_secs
+                                ),
+                                current_file: translated_html_files,
+                                total_files: html_total,
+                                percent: if html_total == 0 {
+                                    100.0
+                                } else {
+                                    (translated_html_files as f32 / html_total as f32) * 100.0
+                                },
+                                translated_characters,
+                            },
+                        );
+                        continue;
+                    }
+
+                    return Err(format!("Error traduciendo {}: {}", file_name, err));
+                }
+            }
+        }
+
+        drop(tx);
+        writer = writer_thread.join().map_err(|_| "Error en el worker the disco".to_string())??;
     }
 
     // Fase 2: Copiar el resto de los archivos (imagenes, css, y archivos no listados en el spine)
@@ -290,6 +574,19 @@ pub async fn translate_epub(
     })
 }
 
+fn build_file_options(meta: EntryMeta) -> zip::write::FileOptions {
+    let mut options = zip::write::FileOptions::default().compression_method(meta.compression);
+    if let Some(mode) = meta.unix_mode {
+        options = options.unix_permissions(mode);
+    }
+    options
+}
+
+fn is_rate_limit_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("429") || lower.contains("rate limit") || lower.contains("too many requests")
+}
+
 fn get_epub_reading_order(archive: &mut ZipArchive<File>) -> Result<Vec<String>, String> {
     let mut file = archive
         .by_name("META-INF/container.xml")
@@ -347,10 +644,8 @@ fn get_epub_reading_order(archive: &mut ZipArchive<File>) -> Result<Vec<String>,
     loop {
         match parser.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                // We must handle namespacing, e.g. `<opf:item ...>` or `<item ...>`
                 let tag_name = e.name();
                 let local_name = tag_name.into_inner();
-                // strip namespaces correctly: usually `item` is `item` but just in case
                 let is_tag = |name_bytes: &[u8], target: &[u8]| -> bool {
                     name_bytes == target || name_bytes.ends_with(&[b':'].iter().chain(target).copied().collect::<Vec<u8>>())
                 };
@@ -430,19 +725,50 @@ fn emit_progress(app: &tauri::AppHandle, payload: TranslationProgressPayload) {
     let _ = app.emit("translation-progress", payload);
 }
 
+fn emit_progress_for_reporter(
+    reporter: Option<&ProgressReporter>,
+    total_text_chars: usize,
+    consumed_chars: usize,
+    message: &str,
+) {
+    if let Some(active_reporter) = reporter {
+        let file_fraction = if total_text_chars == 0 {
+            0.0
+        } else {
+            (consumed_chars as f32 / total_text_chars as f32).min(1.0)
+        };
+        active_reporter.emit(consumed_chars, file_fraction, message);
+    }
+}
+
 async fn translate_html_content(
     client: &Client,
     api_key: &str,
     target_language: &str,
     html: &str,
     char_budget: Option<usize>,
+    options: &TranslationChunkOptions,
+    reporter: Option<&ProgressReporter>,
 ) -> Result<(String, usize), String> {
+    // Fast path for full-book mode: translate larger HTML blocks to reduce
+    // drastically the number of API calls.
+    if !options.enable_streaming && char_budget.is_none() {
+        return translate_html_in_blocks(client, api_key, target_language, html).await;
+    }
+
     let tokens = tokenize_html(html);
     let mut result = String::with_capacity(html.len());
 
     let mut consumed_characters = 0usize;
     let mut skip_tag_depth = 0usize;
     let mut budget_exhausted = false;
+    let total_text_chars = count_translatable_text_chars(&tokens);
+    let enable_chunking = options.enable_chunking && total_text_chars > options.chunk_threshold_chars;
+    let progress_label = if let Some(active_reporter) = reporter {
+        format!("Traduciendo {}", active_reporter.file_name)
+    } else {
+        "Traduciendo".to_string()
+    };
 
     for token in tokens {
         match token.kind {
@@ -464,6 +790,12 @@ async fn translate_html_content(
                         target_language,
                         &token.value,
                         remaining,
+                        options,
+                        enable_chunking,
+                        consumed_characters,
+                        reporter,
+                        total_text_chars,
+                        progress_label.as_str(),
                     )
                     .await?;
 
@@ -473,11 +805,55 @@ async fn translate_html_content(
                 }
 
                 result.push_str(&translated_text);
+                emit_progress_for_reporter(
+                    reporter,
+                    total_text_chars,
+                    consumed_characters,
+                    progress_label.as_str(),
+                );
             }
         }
     }
 
     Ok((result, consumed_characters))
+}
+
+async fn translate_html_in_blocks(
+    client: &Client,
+    api_key: &str,
+    target_language: &str,
+    html: &str,
+) -> Result<(String, usize), String> {
+    let tokens = tokenize_html(html);
+    let consumed = count_translatable_text_chars(&tokens);
+    if consumed == 0 {
+        return Ok((html.to_string(), 0));
+    }
+
+    let blocks = split_html_into_blocks(
+        &tokens,
+        FULL_HTML_BLOCK_MIN_CHARS,
+        FULL_HTML_BLOCK_TARGET_CHARS,
+        FULL_HTML_BLOCK_MAX_CHARS,
+    );
+    if blocks.is_empty() {
+        return Ok((html.to_string(), consumed));
+    }
+
+    let mut translated = String::with_capacity(html.len());
+    for block in blocks {
+        let chunk = ai::translate_text_with_retry(
+            client,
+            api_key,
+            target_language,
+            block.as_str(),
+            MAX_RETRIES,
+        )
+        .await?;
+        translated.push_str(&chunk);
+    }
+
+    Ok((translated, consumed))
 }
 
 async fn translate_text_preserving_whitespace(
@@ -486,6 +862,12 @@ async fn translate_text_preserving_whitespace(
     target_language: &str,
     text: &str,
     remaining_chars: Option<usize>,
+    options: &TranslationChunkOptions,
+    use_chunking: bool,
+    consumed_before: usize,
+    reporter: Option<&ProgressReporter>,
+    total_text_chars: usize,
+    progress_label: &str,
 ) -> Result<(String, usize, bool), String> {
     if text.trim().is_empty() {
         return Ok((text.to_string(), 0, false));
@@ -514,14 +896,29 @@ async fn translate_text_preserving_whitespace(
                 return Ok((text.to_string(), 0, true));
             }
 
-            let translated_head = ai::translate_text_with_retry(
-                client,
-                api_key,
-                target_language,
-                head,
-                MAX_RETRIES,
-            )
-            .await?;
+            let translated_head = {
+                if options.enable_streaming {
+                    let mut on_delta = |_: &str| {
+                        emit_progress_for_reporter(
+                            reporter,
+                            total_text_chars,
+                            consumed_before,
+                            progress_label,
+                        );
+                    };
+                    translate_text(
+                        client,
+                        api_key,
+                        target_language,
+                        head,
+                        options,
+                        Some(&mut on_delta),
+                    )
+                    .await?
+                } else {
+                    translate_text(client, api_key, target_language, head, options, None).await?
+                }
+            };
 
             return Ok((
                 format!("{}{}{}{}", leading, translated_head, tail, trailing),
@@ -533,20 +930,257 @@ async fn translate_text_preserving_whitespace(
         (trimmed.to_string(), trimmed.chars().count(), false)
     };
 
-    let translated = ai::translate_text_with_retry(
-        client,
-        api_key,
-        target_language,
-        &input_to_translate,
-        MAX_RETRIES,
-    )
-    .await?;
+    let translated = if use_chunking {
+        let chunks = split_text_by_sentence(
+            &input_to_translate,
+            options.chunk_min_chars,
+            options.chunk_target_chars,
+            options.max_chunk_chars,
+        );
+        let ranges = if chunks.is_empty() {
+            vec![(0, input_to_translate.len())]
+        } else {
+            chunks
+        };
+
+        let total_chunks = ranges.len();
+        let mut translated_chunks = String::new();
+        let mut consumed_local = 0usize;
+
+        for (index, (start, end)) in ranges.into_iter().enumerate() {
+            let chunk = &input_to_translate[start..end];
+            let chunk_message = if total_chunks > 1 {
+                format!("{} (fragmento {}/{})", progress_label, index + 1, total_chunks)
+            } else {
+                progress_label.to_string()
+            };
+            let chunk_message_ref = chunk_message.as_str();
+
+            let translated_chunk = {
+                if options.enable_streaming {
+                    let mut on_delta = |_: &str| {
+                        emit_progress_for_reporter(
+                            reporter,
+                            total_text_chars,
+                            consumed_before + consumed_local,
+                            chunk_message_ref,
+                        );
+                    };
+                    translate_text(
+                        client,
+                        api_key,
+                        target_language,
+                        chunk,
+                        options,
+                        Some(&mut on_delta),
+                    )
+                    .await?
+                } else {
+                    translate_text(client, api_key, target_language, chunk, options, None).await?
+                }
+            };
+
+            translated_chunks.push_str(&translated_chunk);
+            consumed_local += chunk.chars().count();
+            emit_progress_for_reporter(
+                reporter,
+                total_text_chars,
+                consumed_before + consumed_local,
+                chunk_message_ref,
+            );
+        }
+
+        translated_chunks
+    } else {
+        if options.enable_streaming {
+            let mut on_delta = |_: &str| {
+                emit_progress_for_reporter(
+                    reporter,
+                    total_text_chars,
+                    consumed_before,
+                    progress_label,
+                );
+            };
+            translate_text(
+                client,
+                api_key,
+                target_language,
+                &input_to_translate,
+                options,
+                Some(&mut on_delta),
+            )
+            .await?
+        } else {
+            translate_text(
+                client,
+                api_key,
+                target_language,
+                &input_to_translate,
+                options,
+                None,
+            )
+            .await?
+        }
+    };
 
     Ok((
         format!("{}{}{}", leading, translated, trailing),
         consumed,
         exhausted_now,
     ))
+}
+
+async fn translate_text(
+    client: &Client,
+    api_key: &str,
+    target_language: &str,
+    text: &str,
+    options: &TranslationChunkOptions,
+    on_delta: Option<&mut (dyn FnMut(&str) + Send)>,
+) -> Result<String, String> {
+    if options.enable_streaming {
+        ai::translate_text_with_retry_streaming(
+            client,
+            api_key,
+            target_language,
+            text,
+            MAX_RETRIES,
+            on_delta,
+        )
+        .await
+    } else {
+        ai::translate_text_with_retry(client, api_key, target_language, text, MAX_RETRIES).await
+    }
+}
+
+fn count_translatable_text_chars(tokens: &[HtmlToken]) -> usize {
+    let mut total = 0usize;
+    let mut skip_tag_depth = 0usize;
+
+    for token in tokens {
+        match token.kind {
+            HtmlTokenKind::Tag => update_skip_depth(&token.value, &mut skip_tag_depth),
+            HtmlTokenKind::Text => {
+                if skip_tag_depth == 0 {
+                    total += token.value.chars().count();
+                }
+            }
+        }
+    }
+
+    total
+}
+
+fn split_text_by_sentence(
+    text: &str,
+    min_chars: usize,
+    target_chars: usize,
+    max_chars: usize,
+) -> Vec<(usize, usize)> {
+    let mut segments = Vec::new();
+    if max_chars == 0 || text.is_empty() {
+        return segments;
+    }
+
+    let mut start = 0usize;
+    while start < text.len() {
+        let mut char_count = 0usize;
+        let mut last_sentence_end: Option<usize> = None;
+        let mut end = text.len();
+
+        for (offset, ch) in text[start..].char_indices() {
+            char_count += 1;
+            let idx = start + offset;
+
+            if matches!(ch, '.' | '!' | '?' | '\n') {
+                last_sentence_end = Some(idx + ch.len_utf8());
+            }
+
+            if char_count >= target_chars && char_count >= min_chars {
+                if let Some(sentence_end) = last_sentence_end {
+                    end = sentence_end;
+                    break;
+                }
+            }
+
+            if char_count >= max_chars {
+                end = last_sentence_end.unwrap_or_else(|| idx + ch.len_utf8());
+                break;
+            }
+        }
+
+        if end <= start {
+            break;
+        }
+
+        segments.push((start, end));
+        start = end;
+    }
+
+    segments
+}
+
+fn split_html_into_blocks(
+    tokens: &[HtmlToken],
+    min_chars: usize,
+    target_chars: usize,
+    max_chars: usize,
+) -> Vec<String> {
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut blocks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_chars = 0usize;
+    let mut skip_tag_depth = 0usize;
+
+    for token in tokens {
+        match token.kind {
+            HtmlTokenKind::Tag => {
+                update_skip_depth(&token.value, &mut skip_tag_depth);
+                current.push_str(&token.value);
+
+                let should_split_at_boundary = current_chars >= target_chars
+                    && current_chars >= min_chars
+                    && is_html_boundary_tag(&token.value);
+                let should_force_split = current_chars >= max_chars;
+
+                if should_split_at_boundary || should_force_split {
+                    blocks.push(current);
+                    current = String::new();
+                    current_chars = 0;
+                }
+            }
+            HtmlTokenKind::Text => {
+                current.push_str(&token.value);
+                if skip_tag_depth == 0 && !token.value.trim().is_empty() {
+                    current_chars += token.value.chars().count();
+                }
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+
+    blocks
+}
+
+fn is_html_boundary_tag(tag: &str) -> bool {
+    let lower = tag.to_ascii_lowercase();
+    lower.starts_with("</p")
+        || lower.starts_with("</div")
+        || lower.starts_with("</section")
+        || lower.starts_with("</article")
+        || lower.starts_with("</li")
+        || lower.starts_with("</h1")
+        || lower.starts_with("</h2")
+        || lower.starts_with("</h3")
+        || lower.starts_with("</h4")
+        || lower.starts_with("</blockquote")
+        || lower.starts_with("</br")
 }
 
 fn split_at_char_count(input: &str, char_count: usize) -> (&str, &str) {

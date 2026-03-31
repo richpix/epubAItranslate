@@ -939,6 +939,7 @@ dependencies = [
 name = "epubtr"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "quick-xml 0.39.2",
  "reqwest",
  "serde",

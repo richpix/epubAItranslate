@@ -1,3 +1,4 @@
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -82,6 +83,67 @@ pub async fn translate_text_with_retry(
     }
 }
 
+pub async fn translate_text_with_retry_streaming(
+    client: &Client,
+    api_key: &str,
+    target_language: &str,
+    text: &str,
+    max_retries: u32,
+    on_delta: Option<&mut (dyn FnMut(&str) + Send)>,
+) -> Result<String, String> {
+    let mut attempt: u32 = 0;
+    let mut delay_ms: u64 = 1_000;
+    let sanitized_api_key = api_key.trim();
+
+    if let Some(on_delta) = on_delta {
+        loop {
+            match translate_text_streaming_once(
+                client,
+                sanitized_api_key,
+                target_language,
+                text,
+                Some(on_delta),
+            )
+            .await
+            {
+                Ok(translated) => return Ok(translated),
+                Err(err) => {
+                    if attempt >= max_retries {
+                        return Err(err);
+                    }
+
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                    delay_ms = (delay_ms * 2).min(10_000);
+                }
+            }
+        }
+    }
+
+    loop {
+        match translate_text_streaming_once(
+            client,
+            sanitized_api_key,
+            target_language,
+            text,
+            None,
+        )
+        .await
+        {
+            Ok(translated) => return Ok(translated),
+            Err(err) => {
+                if attempt >= max_retries {
+                    return Err(err);
+                }
+
+                sleep(Duration::from_millis(delay_ms)).await;
+                attempt += 1;
+                delay_ms = (delay_ms * 2).min(10_000);
+            }
+        }
+    }
+}
+
 async fn translate_text_once(
     client: &Client,
     api_key: &str,
@@ -134,6 +196,114 @@ async fn translate_text_once(
         .map(|choice| choice.message.content.trim().to_string())
         .filter(|content| !content.is_empty())
         .ok_or_else(|| "DeepSeek devolvio una traduccion vacia".to_string())?;
+
+    validate_translation_output(text, &translated)?;
+    Ok(translated)
+}
+
+async fn translate_text_streaming_once(
+    client: &Client,
+    api_key: &str,
+    target_language: &str,
+    text: &str,
+    mut on_delta: Option<&mut (dyn FnMut(&str) + Send)>,
+) -> Result<String, String> {
+    if text.trim().is_empty() {
+        return Ok(text.to_string());
+    }
+
+    let response = client
+        .post("https://api.deepseek.com/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "model": "deepseek-chat",
+            "temperature": 0.1,
+            "stream": true,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": format!(
+                        "Eres un traductor literario profesional. Traduce al {} con calidad editorial y naturalidad, como una traduccion humana cuidada. Reglas obligatorias: 1) No resumas ni omitas informacion. 2) No agregues explicaciones, notas ni encabezados. 3) Conserva el tono narrativo, estilo y matices. 4) Si aparecen etiquetas HTML/XML, no las modifiques ni las traduzcas. 5) Si aparecen entidades HTML (por ejemplo &amp;, &lt;, &gt;), conservaalas. 6) Respeta saltos de linea. Devuelve unicamente el texto traducido.",
+                        target_language
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": text
+                }
+            ]
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Error de red: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Error de DeepSeek {}: {}", status, body));
+    }
+
+    let mut buffer = String::new();
+    let mut translated = String::new();
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e: reqwest::Error| format!("Error leyendo stream: {}", e))?;
+        let chunk_text = String::from_utf8_lossy(&bytes);
+        buffer.push_str(&chunk_text);
+
+        while let Some(event_end) = buffer.find("\n\n") {
+            let event = buffer[..event_end].to_string();
+            buffer = buffer[event_end + 2..].to_string();
+
+            for line in event.lines() {
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+
+                let payload = data.trim();
+                if payload == "[DONE]" {
+                    break;
+                }
+
+                let json_value: serde_json::Value =
+                    serde_json::from_str(payload).map_err(|e| {
+                        format!("Respuesta streaming invalida de DeepSeek: {}", e)
+                    })?;
+
+                let delta = json_value
+                    .get("choices")
+                    .and_then(|choices| choices.get(0))
+                    .and_then(|choice| {
+                        choice
+                            .get("delta")
+                            .and_then(|delta| delta.get("content"))
+                            .or_else(|| {
+                                choice
+                                    .get("message")
+                                    .and_then(|message| message.get("content"))
+                            })
+                            .or_else(|| choice.get("text"))
+                    })
+                    .and_then(|value| value.as_str());
+
+                if let Some(content) = delta {
+                    if !content.is_empty() {
+                        translated.push_str(content);
+                        if let Some(callback) = on_delta.as_deref_mut() {
+                            callback(content);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let translated = translated.trim().to_string();
+    if translated.is_empty() {
+        return Err("DeepSeek devolvio una traduccion vacia".to_string());
+    }
 
     validate_translation_output(text, &translated)?;
     Ok(translated)

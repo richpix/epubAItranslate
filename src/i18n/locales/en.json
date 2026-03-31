@@ -32,6 +32,8 @@
     "previewMode": "MVP (5 pages)",
     "fullMode": "Full book",
     "fullModeDisabled": "Full-book mode is disabled in this MVP demo.",
+    "previewModeHint": "Translate only the first 5 pages for a quick test.",
+    "fullModeHint": "Translate the entire book chapter by chapter.",
     "pickInput": "Open EPUB file",
     "pickOutput": "Save as",
     "addApiKey": "Set API key",

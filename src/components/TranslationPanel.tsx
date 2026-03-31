@@ -52,8 +52,10 @@ export function TranslationPanel({
   const [inputPath, setInputPath] = useState("");
   const [outputPath, setOutputPath] = useState("");
   const [targetLanguage, setTargetLanguage] = useState("es");
-  const previewOnly = true;
-  const fullModeEnabled = false;
+  const [translationMode, setTranslationMode] = useState<"preview" | "full">("preview");
+  const previewOnly = translationMode === "preview";
+  const fullModeEnabled = true;
+  const previewPages = 5;
   const [isTranslating, setIsTranslating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -66,7 +68,9 @@ export function TranslationPanel({
     translatedCharacters: 0,
   });
 
-  const translatedModeLabel = t("translation.fullModeDisabled");
+  const translatedModeLabel = previewOnly
+    ? t("translation.previewModeHint")
+    : t("translation.fullModeHint");
 
   const pickInputEpub = async () => {
     const selected = await open({
@@ -136,7 +140,7 @@ export function TranslationPanel({
           outputPath,
           targetLanguage,
           previewOnly,
-          previewPages: 5,
+          previewPages: previewOnly ? previewPages : undefined,
           apiKey: apiKey ?? "",
         },
       });
@@ -195,7 +199,7 @@ export function TranslationPanel({
           <div className="flex items-center gap-3">
             <button
               type="button"
-              onClick={() => undefined}
+              onClick={() => setTranslationMode("preview")}
               className={`px-3 py-2 rounded-md text-sm border ${
                 previewOnly
                   ? "bg-blue-600 text-white border-blue-600"
@@ -207,10 +211,13 @@ export function TranslationPanel({
             </button>
             <button
               type="button"
-              onClick={() => undefined}
-              className="px-3 py-2 rounded-md text-sm border bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed"
+              onClick={() => setTranslationMode("full")}
+              className={`px-3 py-2 rounded-md text-sm border ${
+                !previewOnly
+                  ? "bg-blue-600 text-white border-blue-600"
+                  : "bg-white text-slate-700 border-slate-300"
+              }`}
               disabled={isTranslating || !fullModeEnabled}
-              title={t("translation.fullModeDisabled")}
             >
               {t("translation.fullMode")}
             </button>
