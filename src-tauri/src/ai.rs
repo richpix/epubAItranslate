@@ -8,7 +8,6 @@ use serde_json::json;
 use tokio::time::{sleep, Duration};
 
 const MIN_CONTENT_CHARS_FOR_RATIO_CHECK: usize = 40;
-const TRANSLATION_MAX_TOKENS: u32 = 12_000;
 static SYSTEM_PROMPT_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
@@ -168,7 +167,6 @@ async fn translate_text_once(
         .json(&json!({
             "model": "deepseek-chat",
             "temperature": 0.1,
-            "max_tokens": TRANSLATION_MAX_TOKENS,
             "messages": [
                 {
                     "role": "system",
@@ -226,7 +224,6 @@ async fn translate_text_streaming_once(
         .json(&json!({
             "model": "deepseek-chat",
             "temperature": 0.1,
-            "max_tokens": TRANSLATION_MAX_TOKENS,
             "stream": true,
             "messages": [
                 {

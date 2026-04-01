@@ -22,12 +22,15 @@ const CHAPTER_TOKEN_THRESHOLD: usize = 10_000;
 const CHUNK_MIN_CHARS: usize = 2_000;
 const CHUNK_TARGET_CHARS: usize = 3_000;
 const CHUNK_MAX_CHARS: usize = 4_000;
-const FULL_HTML_BLOCK_MIN_CHARS: usize = 24_000;
-const FULL_HTML_BLOCK_TARGET_CHARS: usize = 36_000;
-const FULL_HTML_BLOCK_MAX_CHARS: usize = 52_000;
-const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
-const DEFAULT_CONCURRENCY_WARMUP: usize = 4;
-const SUCCESS_STREAK_FOR_SCALE_UP: usize = 2;
+const FULL_HTML_BLOCK_MIN_CHARS: usize = 32_000;
+const FULL_HTML_BLOCK_TARGET_CHARS: usize = 48_000;
+const FULL_HTML_BLOCK_MAX_CHARS: usize = 64_000;
+const RECOVERY_BLOCK_MIN_CHARS: usize = 6_000;
+const RECOVERY_BLOCK_TARGET_CHARS: usize = 10_000;
+const RECOVERY_BLOCK_MAX_CHARS: usize = 14_000;
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 10;
+const DEFAULT_CONCURRENCY_WARMUP: usize = 6;
+const SUCCESS_STREAK_FOR_SCALE_UP: usize = 1;
 const MAX_RETRIES: u32 = 4;
 const MAX_CONCURRENCY_ENV: &str = "EPUBTR_MAX_CONCURRENCY";
 const FULL_BLOCK_MIN_ENV: &str = "EPUBTR_FULL_BLOCK_MIN_CHARS";
@@ -530,7 +533,7 @@ pub async fn translate_epub(
                         pending.push_back(chapter_index);
                         success_streak = 0;
                         if active_concurrency > 1 {
-                            active_concurrency = active_concurrency.saturating_sub(2).max(1);
+                            active_concurrency = active_concurrency.saturating_sub(1).max(1);
                         }
 
                         let exponential = 2u64.pow(retry_count.min(4));
@@ -981,9 +984,9 @@ async fn translate_html_in_blocks(
                 let mut recovered_ok = true;
                 let sub_ranges = split_text_by_sentence(
                     block.as_str(),
-                    CHUNK_MIN_CHARS,
-                    CHUNK_TARGET_CHARS,
-                    CHUNK_MAX_CHARS,
+                    RECOVERY_BLOCK_MIN_CHARS,
+                    RECOVERY_BLOCK_TARGET_CHARS,
+                    RECOVERY_BLOCK_MAX_CHARS,
                 );
 
                 if sub_ranges.is_empty() {
