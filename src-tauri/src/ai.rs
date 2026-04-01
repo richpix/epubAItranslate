@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
@@ -5,6 +8,8 @@ use serde_json::json;
 use tokio::time::{sleep, Duration};
 
 const MIN_CONTENT_CHARS_FOR_RATIO_CHECK: usize = 40;
+const TRANSLATION_MAX_TOKENS: u32 = 12_000;
+static SYSTEM_PROMPT_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
@@ -154,6 +159,8 @@ async fn translate_text_once(
         return Ok(text.to_string());
     }
 
+    let system_prompt = get_system_prompt(target_language);
+
     let response = client
         .post("https://api.deepseek.com/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key))
@@ -161,13 +168,11 @@ async fn translate_text_once(
         .json(&json!({
             "model": "deepseek-chat",
             "temperature": 0.1,
+            "max_tokens": TRANSLATION_MAX_TOKENS,
             "messages": [
                 {
                     "role": "system",
-                    "content": format!(
-                        "Eres un traductor literario profesional. Traduce al {} con calidad editorial y naturalidad, como una traduccion humana cuidada. Reglas obligatorias: 1) No resumas ni omitas informacion. 2) No agregues explicaciones, notas ni encabezados. 3) Conserva el tono narrativo, estilo y matices. 4) Si aparecen etiquetas HTML/XML, no las modifiques ni las traduzcas. 5) Si aparecen entidades HTML (por ejemplo &amp;, &lt;, &gt;), conservaalas. 6) Respeta saltos de linea. Devuelve unicamente el texto traducido.",
-                        target_language
-                    )
+                    "content": system_prompt
                 },
                 {
                     "role": "user",
@@ -212,6 +217,8 @@ async fn translate_text_streaming_once(
         return Ok(text.to_string());
     }
 
+    let system_prompt = get_system_prompt(target_language);
+
     let response = client
         .post("https://api.deepseek.com/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key))
@@ -219,14 +226,12 @@ async fn translate_text_streaming_once(
         .json(&json!({
             "model": "deepseek-chat",
             "temperature": 0.1,
+            "max_tokens": TRANSLATION_MAX_TOKENS,
             "stream": true,
             "messages": [
                 {
                     "role": "system",
-                    "content": format!(
-                        "Eres un traductor literario profesional. Traduce al {} con calidad editorial y naturalidad, como una traduccion humana cuidada. Reglas obligatorias: 1) No resumas ni omitas informacion. 2) No agregues explicaciones, notas ni encabezados. 3) Conserva el tono narrativo, estilo y matices. 4) Si aparecen etiquetas HTML/XML, no las modifiques ni las traduzcas. 5) Si aparecen entidades HTML (por ejemplo &amp;, &lt;, &gt;), conservaalas. 6) Respeta saltos de linea. Devuelve unicamente el texto traducido.",
-                        target_language
-                    )
+                    "content": system_prompt
                 },
                 {
                     "role": "user",
@@ -327,6 +332,17 @@ fn validate_translation_output(source: &str, translated: &str) -> Result<(), Str
         return Err("DeepSeek introdujo etiquetas no esperadas".to_string());
     }
 
+    if source_has_tag_like {
+        let source_tag_markers = source_trimmed.matches('<').count();
+        let translated_tag_markers = translated_trimmed.matches('<').count();
+        if source_tag_markers >= 4 && translated_tag_markers * 2 < source_tag_markers {
+            return Err(
+                "DeepSeek devolvio una traduccion posiblemente incompleta (faltan etiquetas)"
+                    .to_string(),
+            );
+        }
+    }
+
     let source_content_len = source_trimmed
         .chars()
         .filter(|c| !c.is_whitespace())
@@ -337,7 +353,7 @@ fn validate_translation_output(source: &str, translated: &str) -> Result<(), Str
         .count();
 
     if source_content_len >= MIN_CONTENT_CHARS_FOR_RATIO_CHECK {
-        if translated_content_len * 4 < source_content_len {
+        if translated_content_len * 3 < source_content_len {
             return Err("DeepSeek devolvio una traduccion demasiado corta".to_string());
         }
 
@@ -369,4 +385,23 @@ fn has_tag_like_fragment(input: &str) -> bool {
     }
 
     false
+}
+
+fn get_system_prompt(target_language: &str) -> String {
+    let cache = SYSTEM_PROMPT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache_guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(prompt) = cache_guard.get(target_language) {
+        return prompt.clone();
+    }
+
+    let prompt = format!(
+        "Eres un traductor literario profesional. Traduce al {} con calidad editorial y naturalidad, como una traduccion humana cuidada. Reglas obligatorias: 1) No resumas ni omitas informacion. 2) No agregues explicaciones, notas ni encabezados. 3) Conserva el tono narrativo, estilo y matices. 4) Si aparecen etiquetas HTML/XML, no las modifiques ni las traduzcas. 5) Si aparecen entidades HTML (por ejemplo &amp;, &lt;, &gt;), conservaalas. 6) Respeta saltos de linea. Devuelve unicamente el texto traducido.",
+        target_language
+    );
+
+    cache_guard.insert(target_language.to_string(), prompt.clone());
+    prompt
 }

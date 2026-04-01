@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::sync::Arc;
+use std::time::Instant;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use quick_xml::events::Event;
@@ -19,11 +22,17 @@ const CHAPTER_TOKEN_THRESHOLD: usize = 10_000;
 const CHUNK_MIN_CHARS: usize = 2_000;
 const CHUNK_TARGET_CHARS: usize = 3_000;
 const CHUNK_MAX_CHARS: usize = 4_000;
-const FULL_HTML_BLOCK_MIN_CHARS: usize = 8_000;
-const FULL_HTML_BLOCK_TARGET_CHARS: usize = 12_000;
-const FULL_HTML_BLOCK_MAX_CHARS: usize = 18_000;
-const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 3;
+const FULL_HTML_BLOCK_MIN_CHARS: usize = 24_000;
+const FULL_HTML_BLOCK_TARGET_CHARS: usize = 36_000;
+const FULL_HTML_BLOCK_MAX_CHARS: usize = 52_000;
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
+const DEFAULT_CONCURRENCY_WARMUP: usize = 4;
+const SUCCESS_STREAK_FOR_SCALE_UP: usize = 2;
 const MAX_RETRIES: u32 = 4;
+const MAX_CONCURRENCY_ENV: &str = "EPUBTR_MAX_CONCURRENCY";
+const FULL_BLOCK_MIN_ENV: &str = "EPUBTR_FULL_BLOCK_MIN_CHARS";
+const FULL_BLOCK_TARGET_ENV: &str = "EPUBTR_FULL_BLOCK_TARGET_CHARS";
+const FULL_BLOCK_MAX_ENV: &str = "EPUBTR_FULL_BLOCK_MAX_CHARS";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,6 +88,9 @@ struct TranslationChunkOptions {
     enable_streaming: bool,
     max_concurrent_requests: usize,
     dynamic_rate_limit: bool,
+    full_block_min_chars: usize,
+    full_block_target_chars: usize,
+    full_block_max_chars: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -88,7 +100,7 @@ struct EntryMeta {
 }
 
 enum SpineEntryContent {
-    Html(String),
+    Html(Arc<str>),
     Raw(Vec<u8>),
 }
 
@@ -135,6 +147,7 @@ pub async fn translate_epub(
     app: tauri::AppHandle,
     request: TranslateEpubRequest,
 ) -> Result<TranslateEpubResult, String> {
+    let overall_start = Instant::now();
     let input_path = request.input_path.trim();
     let output_path = request.output_path.trim();
 
@@ -187,6 +200,28 @@ pub async fn translate_epub(
         .max(1);
     let preview_limit = preview_pages * APPROX_CHARS_PER_PAGE;
 
+    let configured_max_concurrency = if request.preview_only {
+        1
+    } else {
+        read_env_usize(MAX_CONCURRENCY_ENV, DEFAULT_MAX_CONCURRENT_REQUESTS, 1, 16)
+    };
+    let mut full_block_min_chars =
+        read_env_usize(FULL_BLOCK_MIN_ENV, FULL_HTML_BLOCK_MIN_CHARS, 8_000, 120_000);
+    let mut full_block_target_chars = read_env_usize(
+        FULL_BLOCK_TARGET_ENV,
+        FULL_HTML_BLOCK_TARGET_CHARS,
+        8_000,
+        120_000,
+    );
+    let mut full_block_max_chars =
+        read_env_usize(FULL_BLOCK_MAX_ENV, FULL_HTML_BLOCK_MAX_CHARS, 8_000, 120_000);
+
+    if full_block_min_chars > full_block_max_chars {
+        std::mem::swap(&mut full_block_min_chars, &mut full_block_max_chars);
+    }
+    full_block_target_chars =
+        full_block_target_chars.clamp(full_block_min_chars, full_block_max_chars);
+
     let chunk_options = TranslationChunkOptions {
         enable_chunking: !request.preview_only,
         chunk_threshold_chars: CHAPTER_TOKEN_THRESHOLD * APPROX_CHARS_PER_TOKEN,
@@ -194,16 +229,16 @@ pub async fn translate_epub(
         chunk_target_chars: CHUNK_TARGET_CHARS,
         max_chunk_chars: CHUNK_MAX_CHARS,
         enable_streaming: request.preview_only,
-        max_concurrent_requests: if request.preview_only {
-            1
-        } else {
-            DEFAULT_MAX_CONCURRENT_REQUESTS
-        },
+        max_concurrent_requests: configured_max_concurrency,
         dynamic_rate_limit: !request.preview_only,
+        full_block_min_chars,
+        full_block_target_chars,
+        full_block_max_chars,
     };
 
     let mut translated_html_files = 0usize;
     let mut translated_characters = 0usize;
+    let mut fallback_html_files = 0usize;
     let mut processed_paths = HashSet::new();
     let mut spine_entries = Vec::new();
 
@@ -229,7 +264,7 @@ pub async fn translate_epub(
 
         let content = if is_html_path(file_name) {
             match String::from_utf8(bytes) {
-                Ok(source_html) => SpineEntryContent::Html(source_html),
+                Ok(source_html) => SpineEntryContent::Html(Arc::<str>::from(source_html)),
                 Err(err) => SpineEntryContent::Raw(err.into_bytes()),
             }
         } else {
@@ -248,6 +283,16 @@ pub async fn translate_epub(
         .iter()
         .filter(|entry| matches!(entry.content, SpineEntryContent::Html(_)))
         .count();
+
+    println!(
+        "EPUBTR PERF: preparacion {:.2}s (html_files={}, concurrency={}, full_blocks={}..{}..{})",
+        overall_start.elapsed().as_secs_f32(),
+        total_html_files,
+        chunk_options.max_concurrent_requests,
+        chunk_options.full_block_min_chars,
+        chunk_options.full_block_target_chars,
+        chunk_options.full_block_max_chars
+    );
 
     emit_progress(
         &app,
@@ -281,14 +326,14 @@ pub async fn translate_epub(
                             &client,
                             request.api_key.trim(),
                             language_label(&request.target_language),
-                            source_html,
+                            source_html.as_ref(),
                             Some(preview_limit.saturating_sub(translated_characters)),
                             &chunk_options,
                             Some(&reporter),
                         )
                         .await?
                     } else {
-                        (source_html.clone(), 0)
+                        (source_html.to_string(), 0)
                     };
 
                     translated_characters += consumed_chars;
@@ -354,7 +399,8 @@ pub async fn translate_epub(
         
         // Destruct the vector out of logic loop
         let spine_entries_for_writer = std::mem::replace(&mut spine_entries, Vec::new());
-        let writer_thread = std::thread::spawn(move || -> Result<ZipWriter<File>, String> {
+        let writer_thread = std::thread::spawn(move || -> Result<(ZipWriter<File>, usize), String> {
+            let mut writer_fallbacks = 0usize;
             while expected_index < spine_entries_for_writer.len() {
                 let entry = &spine_entries_for_writer[expected_index];
                 let file_options = build_file_options(entry.meta);
@@ -371,29 +417,39 @@ pub async fn translate_epub(
                             writer_local.write_all(html.as_bytes()).map_err(|e| e.to_string())?;
                             expected_index += 1;
                         } else {
-                            if let Ok((idx, html)) = rx.recv() {
-                                if idx == expected_index {
-                                    writer_local.start_file(entry.file_name.as_str(), file_options).map_err(|e| e.to_string())?;
-                                    writer_local.write_all(html.as_bytes()).map_err(|e| e.to_string())?;
-                                    expected_index += 1;
-                                } else {
-                                    buffered_html.insert(idx, html);
+                            match rx.recv() {
+                                Ok((idx, html)) => {
+                                    if idx == expected_index {
+                                        writer_local.start_file(entry.file_name.as_str(), file_options).map_err(|e| e.to_string())?;
+                                        writer_local.write_all(html.as_bytes()).map_err(|e| e.to_string())?;
+                                        expected_index += 1;
+                                    } else {
+                                        buffered_html.insert(idx, html);
+                                    }
                                 }
-                            } else {
-                                break;
+                                Err(_) => {
+                                    // The producer stopped unexpectedly; write original HTML
+                                    // so the output EPUB remains complete instead of truncated.
+                                    if let SpineEntryContent::Html(original_html) = &entry.content {
+                                        writer_local.start_file(entry.file_name.as_str(), file_options).map_err(|e| e.to_string())?;
+                                        writer_local.write_all(original_html.as_bytes()).map_err(|e| e.to_string())?;
+                                        writer_fallbacks += 1;
+                                        expected_index += 1;
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
-            Ok(writer_local)
+            Ok((writer_local, writer_fallbacks))
         });
 
         let mut pending = VecDeque::from(html_indices);
         let mut in_flight = FuturesUnordered::new();
         let mut retries: HashMap<usize, u32> = HashMap::new();
         let max_concurrency = chunk_options.max_concurrent_requests.max(1);
-        let mut active_concurrency = max_concurrency;
+        let mut active_concurrency = max_concurrency.min(DEFAULT_CONCURRENCY_WARMUP).max(1);
         let mut success_streak = 0usize;
 
         while !pending.is_empty() || !in_flight.is_empty() {
@@ -414,7 +470,7 @@ pub async fn translate_epub(
                         &client,
                         &api_key,
                         &target_language,
-                        &source_html,
+                        source_html.as_ref(),
                         None,
                         &options,
                         None,
@@ -437,7 +493,7 @@ pub async fn translate_epub(
 
                     if chunk_options.dynamic_rate_limit
                         && active_concurrency < max_concurrency
-                        && success_streak >= 3
+                        && success_streak >= SUCCESS_STREAK_FOR_SCALE_UP
                     {
                         active_concurrency += 1;
                         success_streak = 0;
@@ -474,10 +530,12 @@ pub async fn translate_epub(
                         pending.push_back(chapter_index);
                         success_streak = 0;
                         if active_concurrency > 1 {
-                            active_concurrency -= 1;
+                            active_concurrency = active_concurrency.saturating_sub(2).max(1);
                         }
 
-                        let backoff_secs = 2u64.pow(retry_count as u32);
+                        let exponential = 2u64.pow(retry_count.min(4));
+                        let jitter = ((chapter_index as u64) + (retry_count as u64)) % 3;
+                        let backoff_secs = (exponential + jitter).clamp(1, 30);
                         tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
 
                         emit_progress(
@@ -485,8 +543,9 @@ pub async fn translate_epub(
                             TranslationProgressPayload {
                                 status: "processing".to_string(),
                                 message: format!(
-                                    "Rate limit, esperando {}s",
-                                    backoff_secs
+                                    "Rate limit, esperando {}s (concurrencia {})",
+                                    backoff_secs,
+                                    active_concurrency
                                 ),
                                 current_file: translated_html_files,
                                 total_files: html_total,
@@ -501,13 +560,52 @@ pub async fn translate_epub(
                         continue;
                     }
 
+                    if let Some(source_html) = original_html_contents.get(&chapter_index) {
+                        tx.send((chapter_index, source_html.to_string())).map_err(|_| {
+                            format!(
+                                "Error traduciendo {} y no se pudo enviar fallback al writer: {}",
+                                file_name, err
+                            )
+                        })?;
+
+                        translated_html_files += 1;
+                        fallback_html_files += 1;
+
+                        let percent = if html_total == 0 {
+                            100.0
+                        } else {
+                            (translated_html_files as f32 / html_total as f32) * 100.0
+                        };
+
+                        emit_progress(
+                            &app,
+                            TranslationProgressPayload {
+                                status: "processing".to_string(),
+                                message: format!(
+                                    "Advertencia: fallback original en {} tras error de traduccion",
+                                    file_name
+                                ),
+                                current_file: translated_html_files,
+                                total_files: html_total,
+                                percent,
+                                translated_characters,
+                            },
+                        );
+
+                        continue;
+                    }
+
                     return Err(format!("Error traduciendo {}: {}", file_name, err));
                 }
             }
         }
 
         drop(tx);
-        writer = writer_thread.join().map_err(|_| "Error en el worker the disco".to_string())??;
+        let (writer_finished, writer_fallbacks) = writer_thread
+            .join()
+            .map_err(|_| "Error en el worker de disco".to_string())??;
+        writer = writer_finished;
+        fallback_html_files += writer_fallbacks;
     }
 
     // Fase 2: Copiar el resto de los archivos (imagenes, css, y archivos no listados en el spine)
@@ -552,6 +650,14 @@ pub async fn translate_epub(
     writer
         .finish()
         .map_err(|e| format!("No se pudo finalizar el EPUB de salida: {}", e))?;
+
+    println!(
+        "EPUBTR PERF: total {:.2}s (translated_files={}, translated_chars={}, fallback_files={})",
+        overall_start.elapsed().as_secs_f32(),
+        translated_html_files,
+        translated_characters,
+        fallback_html_files
+    );
 
     emit_progress(
         &app,
@@ -721,6 +827,17 @@ fn language_label(code: &str) -> &str {
     }
 }
 
+fn read_env_usize(key: &str, default: usize, min: usize, max: usize) -> usize {
+    let Ok(raw) = env::var(key) else {
+        return default.clamp(min, max);
+    };
+
+    match raw.trim().parse::<usize>() {
+        Ok(value) => value.clamp(min, max),
+        Err(_) => default.clamp(min, max),
+    }
+}
+
 fn emit_progress(app: &tauri::AppHandle, payload: TranslationProgressPayload) {
     let _ = app.emit("translation-progress", payload);
 }
@@ -753,7 +870,7 @@ async fn translate_html_content(
     // Fast path for full-book mode: translate larger HTML blocks to reduce
     // drastically the number of API calls.
     if !options.enable_streaming && char_budget.is_none() {
-        return translate_html_in_blocks(client, api_key, target_language, html).await;
+        return translate_html_in_blocks(client, api_key, target_language, html, options).await;
     }
 
     let tokens = tokenize_html(html);
@@ -823,6 +940,7 @@ async fn translate_html_in_blocks(
     api_key: &str,
     target_language: &str,
     html: &str,
+    options: &TranslationChunkOptions,
 ) -> Result<(String, usize), String> {
     let tokens = tokenize_html(html);
     let consumed = count_translatable_text_chars(&tokens);
@@ -832,25 +950,86 @@ async fn translate_html_in_blocks(
 
     let blocks = split_html_into_blocks(
         &tokens,
-        FULL_HTML_BLOCK_MIN_CHARS,
-        FULL_HTML_BLOCK_TARGET_CHARS,
-        FULL_HTML_BLOCK_MAX_CHARS,
+        options.full_block_min_chars,
+        options.full_block_target_chars,
+        options.full_block_max_chars,
     );
     if blocks.is_empty() {
         return Ok((html.to_string(), consumed));
     }
 
     let mut translated = String::with_capacity(html.len());
+    let mut fallback_blocks = 0usize;
     for block in blocks {
-        let chunk = ai::translate_text_with_retry(
+        match ai::translate_text_with_retry(
             client,
             api_key,
             target_language,
             block.as_str(),
             MAX_RETRIES,
         )
-        .await?;
-        translated.push_str(&chunk);
+        .await
+        {
+            Ok(chunk) => translated.push_str(&chunk),
+            Err(err) => {
+                println!(
+                    "Warning: fallo bloque grande, intentando sub-bloques (error={})",
+                    err
+                );
+
+                let mut recovered = String::new();
+                let mut recovered_ok = true;
+                let sub_ranges = split_text_by_sentence(
+                    block.as_str(),
+                    CHUNK_MIN_CHARS,
+                    CHUNK_TARGET_CHARS,
+                    CHUNK_MAX_CHARS,
+                );
+
+                if sub_ranges.is_empty() {
+                    fallback_blocks += 1;
+                    translated.push_str(block.as_str());
+                    continue;
+                }
+
+                for (start, end) in sub_ranges {
+                    let sub = &block[start..end];
+                    match ai::translate_text_with_retry(
+                        client,
+                        api_key,
+                        target_language,
+                        sub,
+                        MAX_RETRIES,
+                    )
+                    .await
+                    {
+                        Ok(piece) => recovered.push_str(&piece),
+                        Err(sub_err) => {
+                            println!(
+                                "Warning: fallo sub-bloque, conservando bloque original (error={})",
+                                sub_err
+                            );
+                            recovered_ok = false;
+                            break;
+                        }
+                    }
+                }
+
+                if recovered_ok && !recovered.is_empty() {
+                    translated.push_str(&recovered);
+                } else {
+                    fallback_blocks += 1;
+                    translated.push_str(block.as_str());
+                }
+            }
+        }
+    }
+
+    if fallback_blocks > 0 {
+        println!(
+            "Warning: se conservaron {} bloques originales para evitar truncado",
+            fallback_blocks
+        );
     }
 
     Ok((translated, consumed))
