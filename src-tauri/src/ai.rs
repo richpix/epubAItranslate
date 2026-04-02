@@ -37,7 +37,11 @@ pub async fn validate_api_key(api_key: String) -> Result<bool, String> {
         return Err("La API key no puede estar vacia".to_string());
     }
 
-    let client = Client::new();
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("No se pudo inicializar cliente HTTP: {}", e))?;
     let res = client
         .post("https://api.deepseek.com/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key.trim()))

@@ -119,15 +119,16 @@ export function TranslationPanel({
     setError(null);
     setSuccessMessage(null);
     setIsTranslating(true);
-
-    const unlisten = await listen<TranslationProgressPayload>(
-      "translation-progress",
-      (event) => {
-        setProgress(event.payload);
-      },
-    );
+    let unlisten: (() => void) | null = null;
 
     try {
+      unlisten = await listen<TranslationProgressPayload>(
+        "translation-progress",
+        (event) => {
+          setProgress(event.payload);
+        },
+      );
+
       const result = await invoke<TranslateResult>("translate_epub", {
         request: {
           inputPath,
@@ -148,7 +149,7 @@ export function TranslationPanel({
     } catch (translationError) {
       setError(String(translationError));
     } finally {
-      unlisten();
+      unlisten?.();
       setIsTranslating(false);
     }
   };

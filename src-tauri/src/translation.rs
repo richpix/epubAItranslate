@@ -2,9 +2,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use quick_xml::events::Event;
@@ -24,14 +25,17 @@ const CHAPTER_TOKEN_THRESHOLD: usize = 10_000;
 const CHUNK_MIN_CHARS: usize = 2_000;
 const CHUNK_TARGET_CHARS: usize = 3_000;
 const CHUNK_MAX_CHARS: usize = 4_000;
-const FULL_HTML_BLOCK_MIN_CHARS: usize = 32_000;
-const FULL_HTML_BLOCK_TARGET_CHARS: usize = 48_000;
-const FULL_HTML_BLOCK_MAX_CHARS: usize = 64_000;
+const FULL_HTML_BLOCK_MIN_CHARS: usize = 12_000;
+const FULL_HTML_BLOCK_TARGET_CHARS: usize = 16_000;
+const FULL_HTML_BLOCK_MAX_CHARS: usize = 20_000;
 const RECOVERY_BLOCK_MIN_CHARS: usize = 6_000;
 const RECOVERY_BLOCK_TARGET_CHARS: usize = 10_000;
 const RECOVERY_BLOCK_MAX_CHARS: usize = 14_000;
 const ADAPTIVE_TRUNCATION_MAX_DEPTH: u8 = 3;
 const ADAPTIVE_TRUNCATION_MIN_CHARS: usize = 1_000;
+const TRUNCATION_RECOVERY_CHUNK_MIN_CHARS: usize = 800;
+const TRUNCATION_RECOVERY_CHUNK_TARGET_CHARS: usize = 1_200;
+const TRUNCATION_RECOVERY_CHUNK_MAX_CHARS: usize = 1_800;
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 10;
 const DEFAULT_CONCURRENCY_WARMUP: usize = 6;
 const SUCCESS_STREAK_FOR_SCALE_UP: usize = 1;
@@ -106,6 +110,7 @@ struct TranslationChunkOptions {
 #[derive(Clone, Copy)]
 struct EntryMeta {
     compression: zip::CompressionMethod,
+    #[cfg(unix)]
     unix_mode: Option<u32>,
 }
 
@@ -178,10 +183,10 @@ pub async fn translate_epub(
 ) -> Result<TranslateEpubResult, String> {
     let overall_start = Instant::now();
     let _translation_run_guard = acquire_translation_run_guard()?;
-    let input_path = request.input_path.trim();
-    let output_path = request.output_path.trim();
+    let input_path_raw = request.input_path.trim();
+    let output_path_raw = request.output_path.trim();
 
-    if input_path.is_empty() || output_path.is_empty() {
+    if input_path_raw.is_empty() || output_path_raw.is_empty() {
         return Err("Las rutas de entrada y salida son obligatorias".to_string());
     }
 
@@ -189,12 +194,34 @@ pub async fn translate_epub(
         return Err("La API key de DeepSeek es obligatoria".to_string());
     }
 
-    if !input_path.to_lowercase().ends_with(".epub") {
+    if !input_path_raw.to_lowercase().ends_with(".epub") {
         return Err("Solo se admiten archivos .epub".to_string());
     }
 
+    let input_path = Path::new(input_path_raw);
+    let output_path = Path::new(output_path_raw);
+
+    let canonical_input = input_path
+        .canonicalize()
+        .map_err(|e| format!("No se pudo resolver la ruta de entrada: {}", e))?;
+    let absolute_output = make_absolute_path(output_path)
+        .map_err(|e| format!("No se pudo resolver la ruta de salida: {}", e))?;
+
+    if canonical_input == absolute_output {
+        return Err("La ruta de salida no puede ser igual a la de entrada".to_string());
+    }
+
+    if let Some(parent) = absolute_output.parent() {
+        if !parent.exists() {
+            return Err(format!(
+                "La carpeta de salida no existe: {}",
+                parent.display()
+            ));
+        }
+    }
+
     let mut reader = ZipArchive::new(
-        File::open(input_path).map_err(|e| format!("No se pudo abrir el EPUB: {}", e))?,
+        File::open(&canonical_input).map_err(|e| format!("No se pudo abrir el EPUB: {}", e))?,
     )
     .map_err(|e| format!("EPUB invalido: {}", e))?;
 
@@ -214,12 +241,14 @@ pub async fn translate_epub(
         }
     };
 
-    let output_file = File::create(output_path)
+    let output_file = File::create(&absolute_output)
         .map_err(|e| format!("No se pudo crear el EPUB de salida: {}", e))?;
     let mut writer = ZipWriter::new(output_file);
     let client = Client::builder()
         .pool_max_idle_per_host(64)
         .tcp_nodelay(true)
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(90))
         .build()
         .map_err(|e| format!("No se pudo inicializar cliente HTTP: {}", e))?;
 
@@ -282,6 +311,7 @@ pub async fn translate_epub(
 
             let meta = EntryMeta {
                 compression: entry.compression(),
+                #[cfg(unix)]
                 unix_mode: entry.unix_mode(),
             };
 
@@ -575,7 +605,9 @@ pub async fn translate_epub(
                         }
 
                         let exponential = 2u64.pow(retry_count.min(4));
-                        let jitter = ((chapter_index as u64) + (retry_count as u64)) % 3;
+                        let jitter_seed = (chapter_index as u64)
+                            ^ ((retry_count as u64 + 1) * 0x9E37_79B9_7F4A_7C15);
+                        let jitter = jitter_seed.rotate_left(17) % 5;
                         let backoff_secs = (exponential + jitter).clamp(1, 30);
                         tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
 
@@ -663,28 +695,36 @@ pub async fn translate_epub(
                 continue;
             }
 
-            let mut options = zip::write::FileOptions::default().compression_method(entry.compression());
-            if let Some(mode) = entry.unix_mode() {
-                options = options.unix_permissions(mode);
-            }
+            let options = zip::write::FileOptions::default().compression_method(entry.compression());
+            #[cfg(unix)]
+            let options = if let Some(mode) = entry.unix_mode() {
+                options.unix_permissions(mode)
+            } else {
+                options
+            };
 
             if entry.is_dir() {
                 (name, options, true, Vec::new())
             } else {
                 let mut bytes = Vec::new();
-                if let Err(_) = entry.read_to_end(&mut bytes) {
-                    continue;
-                }
+                entry
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| format!("Error leyendo archivo {}: {}", name, e))?;
                 (name, options, false, bytes)
             }
         };
 
         if is_directory {
-            let _ = writer.add_directory(file_name.as_str(), options);
+            writer
+                .add_directory(file_name.as_str(), options)
+                .map_err(|e| format!("No se pudo crear directorio {}: {}", file_name, e))?;
         } else {
-            if let Ok(()) = writer.start_file(file_name.as_str(), options) {
-                let _ = writer.write_all(&bytes);
-            }
+            writer
+                .start_file(file_name.as_str(), options)
+                .map_err(|e| format!("No se pudo crear archivo {} en ZIP: {}", file_name, e))?;
+            writer
+                .write_all(&bytes)
+                .map_err(|e| format!("No se pudo escribir archivo {} en ZIP: {}", file_name, e))?;
         }
     }
 
@@ -715,7 +755,7 @@ pub async fn translate_epub(
     notify_translation_completed_dialog(&app, overall_start.elapsed(), request.preview_only);
 
     Ok(TranslateEpubResult {
-        output_path: output_path.to_string(),
+        output_path: absolute_output.to_string_lossy().to_string(),
         total_html_files,
         translated_html_files,
         translated_characters,
@@ -724,10 +764,13 @@ pub async fn translate_epub(
 }
 
 fn build_file_options(meta: EntryMeta) -> zip::write::FileOptions {
-    let mut options = zip::write::FileOptions::default().compression_method(meta.compression);
-    if let Some(mode) = meta.unix_mode {
-        options = options.unix_permissions(mode);
-    }
+    let options = zip::write::FileOptions::default().compression_method(meta.compression);
+    #[cfg(unix)]
+    let options = if let Some(mode) = meta.unix_mode {
+        options.unix_permissions(mode)
+    } else {
+        options
+    };
     options
 }
 
@@ -847,7 +890,7 @@ fn get_epub_reading_order(archive: &mut ZipArchive<File>) -> Result<Vec<String>,
     let mut reading_order = Vec::new();
     for idref in spine {
         if let Some(href) = manifest.get(&idref) {
-            let full_path = format!("{}{}", base_path, href);
+            let full_path = join_epub_internal_path(base_path, href);
             reading_order.push(full_path);
         }
     }
@@ -858,6 +901,37 @@ fn get_epub_reading_order(archive: &mut ZipArchive<File>) -> Result<Vec<String>,
 fn is_html_path(path: &str) -> bool {
     let lower = path.to_lowercase();
     lower.ends_with(".xhtml") || lower.ends_with(".html") || lower.ends_with(".htm")
+}
+
+fn make_absolute_path(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+
+    let cwd = env::current_dir().map_err(|e| e.to_string())?;
+    Ok(cwd.join(path))
+}
+
+fn join_epub_internal_path(base_path: &str, href: &str) -> String {
+    let combined = if href.starts_with('/') {
+        href.trim_start_matches('/').to_string()
+    } else {
+        format!("{}{}", base_path, href)
+    };
+
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in combined.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            let _ = segments.pop();
+            continue;
+        }
+        segments.push(segment);
+    }
+
+    segments.join("/")
 }
 
 fn language_label(code: &str) -> &str {
@@ -1123,6 +1197,22 @@ async fn translate_block_with_adaptive_splitting(
                     }
                 }
 
+                if is_truncated_by_length_error(&err) {
+                    println!(
+                        "Warning: truncado persistente, activando recovery por nodos de texto"
+                    );
+                    let recovered =
+                        translate_block_with_text_node_recovery(
+                            client,
+                            api_key,
+                            target_language,
+                            segment.as_str(),
+                        )
+                        .await?;
+                    translated.push_str(&recovered);
+                    continue;
+                }
+
                 return Err(err);
             }
         }
@@ -1150,6 +1240,73 @@ fn split_segment_for_truncation_retry(segment_html: &str, depth: u8) -> Vec<Stri
 
 fn is_truncated_by_length_error(error: &str) -> bool {
     error.contains("TRUNCATED_BY_LENGTH")
+}
+
+async fn translate_block_with_text_node_recovery(
+    client: &Client,
+    api_key: &str,
+    target_language: &str,
+    block_html: &str,
+) -> Result<String, String> {
+    let recovery_options = TranslationChunkOptions {
+        enable_chunking: true,
+        chunk_threshold_chars: 1,
+        chunk_min_chars: TRUNCATION_RECOVERY_CHUNK_MIN_CHARS,
+        chunk_target_chars: TRUNCATION_RECOVERY_CHUNK_TARGET_CHARS,
+        max_chunk_chars: TRUNCATION_RECOVERY_CHUNK_MAX_CHARS,
+        enable_streaming: false,
+        max_concurrent_requests: 1,
+        dynamic_rate_limit: false,
+        full_block_min_chars: RECOVERY_BLOCK_MIN_CHARS,
+        full_block_target_chars: RECOVERY_BLOCK_TARGET_CHARS,
+        full_block_max_chars: RECOVERY_BLOCK_MAX_CHARS,
+        force_text_node_mode: true,
+    };
+
+    let tokens = tokenize_html(block_html);
+    let total_text_chars = count_translatable_text_chars(&tokens);
+    if total_text_chars == 0 {
+        return Ok(block_html.to_string());
+    }
+
+    let mut translated = String::with_capacity(block_html.len());
+    let mut skip_tag_depth = 0usize;
+    let mut consumed_before = 0usize;
+
+    for token in tokens {
+        match token.kind {
+            HtmlTokenKind::Tag => {
+                update_skip_depth(&token.value, &mut skip_tag_depth);
+                translated.push_str(&token.value);
+            }
+            HtmlTokenKind::Text => {
+                if skip_tag_depth > 0 || token.value.trim().is_empty() {
+                    translated.push_str(&token.value);
+                    continue;
+                }
+
+                let (translated_text, consumed, _) = translate_text_preserving_whitespace(
+                    client,
+                    api_key,
+                    target_language,
+                    &token.value,
+                    None,
+                    &recovery_options,
+                    true,
+                    consumed_before,
+                    None,
+                    total_text_chars,
+                    "Recuperando bloque truncado",
+                )
+                .await?;
+
+                consumed_before += consumed;
+                translated.push_str(&translated_text);
+            }
+        }
+    }
+
+    Ok(translated)
 }
 
 async fn translate_text_preserving_whitespace(
