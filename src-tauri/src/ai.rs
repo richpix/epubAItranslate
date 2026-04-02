@@ -18,6 +18,7 @@ struct ChatCompletionResponse {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ChatMessage,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,8 +74,33 @@ pub async fn translate_text_with_retry(
 
     loop {
         match translate_text_once(client, sanitized_api_key, target_language, text).await {
-            Ok(translated) => return Ok(translated),
+            Ok(translated) => {
+                if should_retry_for_han(target_language, &translated) {
+                    match translate_text_once_strict_spanish(
+                        client,
+                        sanitized_api_key,
+                        target_language,
+                        text,
+                    )
+                    .await
+                    {
+                        Ok(strict_translated) => {
+                            if should_retry_for_han(target_language, &strict_translated) {
+                                return Ok(translated);
+                            }
+                            return Ok(strict_translated);
+                        }
+                        Err(_) => return Ok(translated),
+                    }
+                }
+
+                return Ok(translated);
+            }
             Err(err) => {
+                if is_non_retryable_error(&err) {
+                    return Err(err);
+                }
+
                 if attempt >= max_retries {
                     return Err(err);
                 }
@@ -112,6 +138,10 @@ pub async fn translate_text_with_retry_streaming(
             {
                 Ok(translated) => return Ok(translated),
                 Err(err) => {
+                    if is_non_retryable_error(&err) {
+                        return Err(err);
+                    }
+
                     if attempt >= max_retries {
                         return Err(err);
                     }
@@ -136,6 +166,10 @@ pub async fn translate_text_with_retry_streaming(
         {
             Ok(translated) => return Ok(translated),
             Err(err) => {
+                if is_non_retryable_error(&err) {
+                    return Err(err);
+                }
+
                 if attempt >= max_retries {
                     return Err(err);
                 }
@@ -193,10 +227,16 @@ async fn translate_text_once(
         .await
         .map_err(|e| format!("Respuesta invalida de DeepSeek: {}", e))?;
 
-    let translated = payload
+    let first_choice = payload
         .choices
         .first()
-        .map(|choice| choice.message.content.trim().to_string())
+        .ok_or_else(|| "DeepSeek devolvio una respuesta sin opciones".to_string())?;
+
+    if matches!(first_choice.finish_reason.as_deref(), Some("length")) {
+        return Err("TRUNCATED_BY_LENGTH".to_string());
+    }
+
+    let translated = Some(first_choice.message.content.trim().to_string())
         .filter(|content| !content.is_empty())
         .ok_or_else(|| "DeepSeek devolvio una traduccion vacia".to_string())?;
 
@@ -401,4 +441,100 @@ fn get_system_prompt(target_language: &str) -> String {
 
     cache_guard.insert(target_language.to_string(), prompt.clone());
     prompt
+}
+
+async fn translate_text_once_strict_spanish(
+    client: &Client,
+    api_key: &str,
+    target_language: &str,
+    text: &str,
+) -> Result<String, String> {
+    if text.trim().is_empty() {
+        return Ok(text.to_string());
+    }
+
+    let strict_prompt = format!(
+        "{} IMPORTANTE: Responde SOLO en {}. NO uses chino simplificado ni tradicional. Si no sabes un termino, transliteralo o dejalo en el idioma original, pero nunca chino.",
+        get_system_prompt(target_language),
+        target_language
+    );
+
+    let response = client
+        .post("https://api.deepseek.com/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "model": "deepseek-chat",
+            "temperature": 0.1,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": strict_prompt
+                },
+                {
+                    "role": "user",
+                    "content": text
+                }
+            ]
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Error de red: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Error de DeepSeek {}: {}", status, body));
+    }
+
+    let payload: ChatCompletionResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Respuesta invalida de DeepSeek: {}", e))?;
+
+    let translated = payload
+        .choices
+        .first()
+        .map(|choice| choice.message.content.trim().to_string())
+        .filter(|content| !content.is_empty())
+        .ok_or_else(|| "DeepSeek devolvio una traduccion vacia".to_string())?;
+
+    validate_translation_output(text, &translated)?;
+    Ok(translated)
+}
+
+fn should_retry_for_han(target_language: &str, translated: &str) -> bool {
+    if !is_spanish_target(target_language) {
+        return false;
+    }
+
+    let han_count = translated
+        .chars()
+        .filter(|ch| is_cjk_han(*ch))
+        .count();
+
+    han_count >= 3
+}
+
+fn is_spanish_target(target_language: &str) -> bool {
+    let normalized = target_language.to_ascii_lowercase();
+    normalized.contains("espan") || normalized == "es"
+}
+
+fn is_cjk_han(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x4E00..=0x9FFF
+            | 0x3400..=0x4DBF
+            | 0x20000..=0x2A6DF
+            | 0x2A700..=0x2B73F
+            | 0x2B740..=0x2B81F
+            | 0x2B820..=0x2CEAF
+            | 0xF900..=0xFAFF
+            | 0x2F800..=0x2FA1F
+    )
+}
+
+fn is_non_retryable_error(error: &str) -> bool {
+    error.contains("TRUNCATED_BY_LENGTH")
 }

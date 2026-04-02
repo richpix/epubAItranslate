@@ -32,6 +32,7 @@ const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 10;
 const DEFAULT_CONCURRENCY_WARMUP: usize = 6;
 const SUCCESS_STREAK_FOR_SCALE_UP: usize = 1;
 const MAX_RETRIES: u32 = 4;
+const SAFE_TAIL_HTML_FILES: usize = 0;
 const MAX_CONCURRENCY_ENV: &str = "EPUBTR_MAX_CONCURRENCY";
 const FULL_BLOCK_MIN_ENV: &str = "EPUBTR_FULL_BLOCK_MIN_CHARS";
 const FULL_BLOCK_TARGET_ENV: &str = "EPUBTR_FULL_BLOCK_TARGET_CHARS";
@@ -94,6 +95,7 @@ struct TranslationChunkOptions {
     full_block_min_chars: usize,
     full_block_target_chars: usize,
     full_block_max_chars: usize,
+    force_text_node_mode: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -237,6 +239,7 @@ pub async fn translate_epub(
         full_block_min_chars,
         full_block_target_chars,
         full_block_max_chars,
+        force_text_node_mode: false,
     };
 
     let mut translated_html_files = 0usize;
@@ -385,6 +388,13 @@ pub async fn translate_epub(
         }
         let html_total = html_indices.len();
 
+        let tail_safe_html_indices: HashSet<usize> = if html_total > 0 && SAFE_TAIL_HTML_FILES > 0 {
+            let tail_start = html_total.saturating_sub(SAFE_TAIL_HTML_FILES);
+            html_indices.iter().skip(tail_start).copied().collect()
+        } else {
+            HashSet::new()
+        };
+
         let (tx, rx) = std::sync::mpsc::channel::<(usize, String)>();
         
         let mut writer_local = writer;
@@ -466,7 +476,10 @@ pub async fn translate_epub(
                 let client = client.clone();
                 let api_key = request.api_key.trim().to_string();
                 let target_language = language_label(&request.target_language).to_string();
-                let options = chunk_options;
+                let mut options = chunk_options;
+                if tail_safe_html_indices.contains(&chapter_index) {
+                    options.force_text_node_mode = true;
+                }
 
                 in_flight.push(async move {
                     let translated = translate_html_content(
@@ -872,7 +885,7 @@ async fn translate_html_content(
 ) -> Result<(String, usize), String> {
     // Fast path for full-book mode: translate larger HTML blocks to reduce
     // drastically the number of API calls.
-    if !options.enable_streaming && char_budget.is_none() {
+    if !options.enable_streaming && char_budget.is_none() && !options.force_text_node_mode {
         return translate_html_in_blocks(client, api_key, target_language, html, options).await;
     }
 
@@ -897,27 +910,45 @@ async fn translate_html_content(
                 result.push_str(&token.value);
             }
             HtmlTokenKind::Text => {
-                if skip_tag_depth > 0 || token.value.trim().is_empty() || budget_exhausted {
-                    result.push_str(&token.value);
+                let token_text = token.value;
+
+                if skip_tag_depth > 0 || token_text.trim().is_empty() || budget_exhausted {
+                    result.push_str(&token_text);
                     continue;
                 }
 
                 let remaining = char_budget.map(|limit| limit.saturating_sub(consumed_characters));
-                let (translated_text, consumed, exhausted_now) =
-                    translate_text_preserving_whitespace(
-                        client,
-                        api_key,
-                        target_language,
-                        &token.value,
-                        remaining,
-                        options,
-                        enable_chunking,
-                        consumed_characters,
-                        reporter,
-                        total_text_chars,
-                        progress_label.as_str(),
-                    )
-                    .await?;
+                let translated_piece = translate_text_preserving_whitespace(
+                    client,
+                    api_key,
+                    target_language,
+                    &token_text,
+                    remaining,
+                    options,
+                    enable_chunking,
+                    consumed_characters,
+                    reporter,
+                    total_text_chars,
+                    progress_label.as_str(),
+                )
+                .await;
+
+                let (translated_text, consumed, exhausted_now) = match translated_piece {
+                    Ok(value) => value,
+                    Err(err) => {
+                        // In full mode, keep the original text node when one segment fails
+                        // to avoid downgrading an entire chapter to fallback English.
+                        if !options.enable_streaming && char_budget.is_none() {
+                            println!(
+                                "Warning: fallo segmentado, conservando texto original en nodo (error={})",
+                                err
+                            );
+                            (token_text.clone(), 0, false)
+                        } else {
+                            return Err(err);
+                        }
+                    }
+                };
 
                 consumed_characters += consumed;
                 if exhausted_now {
@@ -981,27 +1012,26 @@ async fn translate_html_in_blocks(
                 );
 
                 let mut recovered = String::new();
-                let mut recovered_ok = true;
-                let sub_ranges = split_text_by_sentence(
-                    block.as_str(),
+                let sub_tokens = tokenize_html(block.as_str());
+                let sub_blocks = split_html_into_blocks(
+                    &sub_tokens,
                     RECOVERY_BLOCK_MIN_CHARS,
                     RECOVERY_BLOCK_TARGET_CHARS,
                     RECOVERY_BLOCK_MAX_CHARS,
                 );
 
-                if sub_ranges.is_empty() {
+                if sub_blocks.is_empty() {
                     fallback_blocks += 1;
                     translated.push_str(block.as_str());
                     continue;
                 }
 
-                for (start, end) in sub_ranges {
-                    let sub = &block[start..end];
+                for sub in sub_blocks {
                     match ai::translate_text_with_retry(
                         client,
                         api_key,
                         target_language,
-                        sub,
+                        sub.as_str(),
                         MAX_RETRIES,
                     )
                     .await
@@ -1009,16 +1039,16 @@ async fn translate_html_in_blocks(
                         Ok(piece) => recovered.push_str(&piece),
                         Err(sub_err) => {
                             println!(
-                                "Warning: fallo sub-bloque, conservando bloque original (error={})",
+                                "Warning: fallo sub-bloque, conservando sub-bloque original (error={})",
                                 sub_err
                             );
-                            recovered_ok = false;
-                            break;
+                            fallback_blocks += 1;
+                            recovered.push_str(sub.as_str());
                         }
                     }
                 }
 
-                if recovered_ok && !recovered.is_empty() {
+                if !recovered.is_empty() {
                     translated.push_str(&recovered);
                 } else {
                     fallback_blocks += 1;
