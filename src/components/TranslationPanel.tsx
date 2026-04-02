@@ -52,10 +52,6 @@ export function TranslationPanel({
   const [inputPath, setInputPath] = useState("");
   const [outputPath, setOutputPath] = useState("");
   const [targetLanguage, setTargetLanguage] = useState("es");
-  const [translationMode, setTranslationMode] = useState<"preview" | "full">("preview");
-  const previewOnly = translationMode === "preview";
-  const fullModeEnabled = true;
-  const previewPages = 5;
   const [isTranslating, setIsTranslating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -68,9 +64,7 @@ export function TranslationPanel({
     translatedCharacters: 0,
   });
 
-  const translatedModeLabel = previewOnly
-    ? t("translation.previewModeHint")
-    : t("translation.fullModeHint");
+  const translatedModeLabel = t("translation.fullModeHint");
 
   const pickInputEpub = async () => {
     const selected = await open({
@@ -139,8 +133,7 @@ export function TranslationPanel({
           inputPath,
           outputPath,
           targetLanguage,
-          previewOnly,
-          previewPages: previewOnly ? previewPages : undefined,
+          previewOnly: false,
           apiKey: apiKey ?? "",
         },
       });
@@ -199,25 +192,8 @@ export function TranslationPanel({
           <div className="flex items-center gap-3">
             <button
               type="button"
-              onClick={() => setTranslationMode("preview")}
-              className={`px-3 py-2 rounded-md text-sm border ${
-                previewOnly
-                  ? "bg-blue-600 text-white border-blue-600"
-                  : "bg-white text-slate-700 border-slate-300"
-              }`}
-              disabled={isTranslating}
-            >
-              {t("translation.previewMode")}
-            </button>
-            <button
-              type="button"
-              onClick={() => setTranslationMode("full")}
-              className={`px-3 py-2 rounded-md text-sm border ${
-                !previewOnly
-                  ? "bg-blue-600 text-white border-blue-600"
-                  : "bg-white text-slate-700 border-slate-300"
-              }`}
-              disabled={isTranslating || !fullModeEnabled}
+              className="px-3 py-2 rounded-md text-sm border bg-blue-600 text-white border-blue-600 cursor-default"
+              disabled
             >
               {t("translation.fullMode")}
             </button>

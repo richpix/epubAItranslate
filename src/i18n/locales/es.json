@@ -1,9 +1,6 @@
 {
   "sidebar": {
     "title": "Epub Translator",
-    "library": "Biblioteca",
-    "translate": "Traducir",
-    "settings": "Ajustes",
     "toggle": "Alternar Menú",
     "switchLanguage": "Cambiar Idioma",
     "apiKey": "Clave IA"
@@ -19,9 +16,9 @@
     "validating": "Validando..."
   },
   "home": {
-    "title": "Bienvenido a Traductor de Epub, Valentina",
-    "description": "Traduce tus libros epub de manera facil con IA",
-    "content": "El layout responsive está listo. Intenta reducir el ancho de la ventana para ver cómo el Sidebar colapsa o solo muestra íconos interactivos."
+    "title": "Traductor de EPUB",
+    "description": "Traduce tus libros EPUB con IA de forma rapida y precisa.",
+    "content": "Selecciona un archivo, configura la salida y ejecuta la traduccion completa desde esta pantalla."
   },
   "translation": {
     "title": "Traducir EPUB",
@@ -29,10 +26,7 @@
     "targetLanguage": "Idioma de destino",
     "moreLanguagesSoon": "La lista es extensible. Por ahora el MVP usa Español.",
     "mode": "Modo de traducción",
-    "previewMode": "MVP (5 páginas)",
     "fullMode": "Libro completo",
-    "fullModeDisabled": "Modo libro completo deshabilitado para esta demo MVP.",
-    "previewModeHint": "Traduce solo las primeras 5 páginas para una prueba rápida.",
     "fullModeHint": "Traduce el libro completo capítulo por capítulo.",
     "pickInput": "Abrir archivo EPUB",
     "pickOutput": "Guardar como",

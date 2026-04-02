@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env;
 use std::sync::{Mutex, OnceLock};
 
 use futures_util::StreamExt;
@@ -8,6 +9,10 @@ use serde_json::json;
 use tokio::time::{sleep, Duration};
 
 const MIN_CONTENT_CHARS_FOR_RATIO_CHECK: usize = 40;
+const MAX_OUTPUT_TOKENS_ENV: &str = "EPUBTR_MAX_OUTPUT_TOKENS";
+const MIN_OUTPUT_TOKENS: usize = 512;
+const DEFAULT_OUTPUT_TOKENS_CAP: usize = 8_192;
+const MAX_OUTPUT_TOKENS_CAP: usize = 12_288;
 static SYSTEM_PROMPT_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +199,8 @@ async fn translate_text_once(
 
     let system_prompt = get_system_prompt(target_language);
 
+    let max_tokens = resolve_max_output_tokens(text);
+
     let response = client
         .post("https://api.deepseek.com/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key))
@@ -201,6 +208,7 @@ async fn translate_text_once(
         .json(&json!({
             "model": "deepseek-chat",
             "temperature": 0.1,
+            "max_tokens": max_tokens,
             "messages": [
                 {
                     "role": "system",
@@ -257,6 +265,8 @@ async fn translate_text_streaming_once(
 
     let system_prompt = get_system_prompt(target_language);
 
+    let max_tokens = resolve_max_output_tokens(text);
+
     let response = client
         .post("https://api.deepseek.com/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key))
@@ -264,6 +274,7 @@ async fn translate_text_streaming_once(
         .json(&json!({
             "model": "deepseek-chat",
             "temperature": 0.1,
+            "max_tokens": max_tokens,
             "stream": true,
             "messages": [
                 {
@@ -288,6 +299,7 @@ async fn translate_text_streaming_once(
 
     let mut buffer = String::new();
     let mut translated = String::new();
+    let mut finish_reason: Option<String> = None;
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
@@ -313,6 +325,15 @@ async fn translate_text_streaming_once(
                     serde_json::from_str(payload).map_err(|e| {
                         format!("Respuesta streaming invalida de DeepSeek: {}", e)
                     })?;
+
+                if let Some(reason) = json_value
+                    .get("choices")
+                    .and_then(|choices| choices.get(0))
+                    .and_then(|choice| choice.get("finish_reason"))
+                    .and_then(|value| value.as_str())
+                {
+                    finish_reason = Some(reason.to_string());
+                }
 
                 let delta = json_value
                     .get("choices")
@@ -345,6 +366,10 @@ async fn translate_text_streaming_once(
     let translated = translated.trim().to_string();
     if translated.is_empty() {
         return Err("DeepSeek devolvio una traduccion vacia".to_string());
+    }
+
+    if matches!(finish_reason.as_deref(), Some("length")) {
+        return Err("TRUNCATED_BY_LENGTH".to_string());
     }
 
     validate_translation_output(text, &translated)?;
@@ -459,6 +484,8 @@ async fn translate_text_once_strict_spanish(
         target_language
     );
 
+    let max_tokens = resolve_max_output_tokens(text);
+
     let response = client
         .post("https://api.deepseek.com/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key))
@@ -466,6 +493,7 @@ async fn translate_text_once_strict_spanish(
         .json(&json!({
             "model": "deepseek-chat",
             "temperature": 0.1,
+            "max_tokens": max_tokens,
             "messages": [
                 {
                     "role": "system",
@@ -537,4 +565,24 @@ fn is_cjk_han(ch: char) -> bool {
 
 fn is_non_retryable_error(error: &str) -> bool {
     error.contains("TRUNCATED_BY_LENGTH")
+}
+
+fn resolve_max_output_tokens(text: &str) -> usize {
+    if let Some(override_value) = read_env_usize(
+        MAX_OUTPUT_TOKENS_ENV,
+        MIN_OUTPUT_TOKENS,
+        MAX_OUTPUT_TOKENS_CAP,
+    ) {
+        return override_value;
+    }
+
+    let chars = text.chars().count();
+    let estimated = (chars * 7) / 20 + 256;
+    estimated.clamp(MIN_OUTPUT_TOKENS, DEFAULT_OUTPUT_TOKENS_CAP)
+}
+
+fn read_env_usize(key: &str, min: usize, max: usize) -> Option<usize> {
+    let raw = env::var(key).ok()?;
+    let parsed = raw.trim().parse::<usize>().ok()?;
+    Some(parsed.clamp(min, max))
 }

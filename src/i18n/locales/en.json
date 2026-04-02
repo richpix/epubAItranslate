@@ -1,9 +1,6 @@
 {
   "sidebar": {
     "title": "Epub Translator",
-    "library": "Library",
-    "translate": "Translate",
-    "settings": "Settings",
     "toggle": "Toggle Sidebar",
     "switchLanguage": "Switch Language",
     "apiKey": "AI Key"
@@ -19,9 +16,9 @@
     "validating": "Validating..."
   },
   "home": {
-    "title": "Welcome to Epub Translator, Valentina",
-    "description": "Easily translate your epub books with AI",
-    "content": "The responsive layout is ready. Try reducing the window width to see how the Sidebar collapses or only shows interactive icons."
+    "title": "EPUB Translator",
+    "description": "Translate your EPUB books with AI quickly and accurately.",
+    "content": "Select a file, configure the output, and run the full translation from this screen."
   },
   "translation": {
     "title": "Translate EPUB",
@@ -29,10 +26,7 @@
     "targetLanguage": "Target language",
     "moreLanguagesSoon": "This list is extensible. The MVP starts with Spanish.",
     "mode": "Translation mode",
-    "previewMode": "MVP (5 pages)",
     "fullMode": "Full book",
-    "fullModeDisabled": "Full-book mode is disabled in this MVP demo.",
-    "previewModeHint": "Translate only the first 5 pages for a quick test.",
     "fullModeHint": "Translate the entire book chapter by chapter.",
     "pickInput": "Open EPUB file",
     "pickOutput": "Save as",

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -11,6 +12,7 @@ use quick_xml::reader::Reader;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use zip::{ZipArchive, ZipWriter};
 
 use crate::ai;
@@ -28,6 +30,8 @@ const FULL_HTML_BLOCK_MAX_CHARS: usize = 64_000;
 const RECOVERY_BLOCK_MIN_CHARS: usize = 6_000;
 const RECOVERY_BLOCK_TARGET_CHARS: usize = 10_000;
 const RECOVERY_BLOCK_MAX_CHARS: usize = 14_000;
+const ADAPTIVE_TRUNCATION_MAX_DEPTH: u8 = 3;
+const ADAPTIVE_TRUNCATION_MIN_CHARS: usize = 1_000;
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 10;
 const DEFAULT_CONCURRENCY_WARMUP: usize = 6;
 const SUCCESS_STREAK_FOR_SCALE_UP: usize = 1;
@@ -37,6 +41,7 @@ const MAX_CONCURRENCY_ENV: &str = "EPUBTR_MAX_CONCURRENCY";
 const FULL_BLOCK_MIN_ENV: &str = "EPUBTR_FULL_BLOCK_MIN_CHARS";
 const FULL_BLOCK_TARGET_ENV: &str = "EPUBTR_FULL_BLOCK_TARGET_CHARS";
 const FULL_BLOCK_MAX_ENV: &str = "EPUBTR_FULL_BLOCK_MAX_CHARS";
+static TRANSLATION_RUN_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -124,6 +129,25 @@ struct ProgressReporter {
     base_translated_chars: usize,
 }
 
+struct TranslationRunGuard;
+
+impl Drop for TranslationRunGuard {
+    fn drop(&mut self) {
+        TRANSLATION_RUN_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+fn acquire_translation_run_guard() -> Result<TranslationRunGuard, String> {
+    TRANSLATION_RUN_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| {
+            "Ya hay una traduccion en curso. Espera a que termine antes de iniciar otra."
+                .to_string()
+        })?;
+
+    Ok(TranslationRunGuard)
+}
+
 impl ProgressReporter {
     fn emit(&self, consumed_chars: usize, file_fraction: f32, message: &str) {
         let percent = if self.total_files == 0 {
@@ -153,6 +177,7 @@ pub async fn translate_epub(
     request: TranslateEpubRequest,
 ) -> Result<TranslateEpubResult, String> {
     let overall_start = Instant::now();
+    let _translation_run_guard = acquire_translation_run_guard()?;
     let input_path = request.input_path.trim();
     let output_path = request.output_path.trim();
 
@@ -687,6 +712,8 @@ pub async fn translate_epub(
         },
     );
 
+    notify_translation_completed_dialog(&app, overall_start.elapsed(), request.preview_only);
+
     Ok(TranslateEpubResult {
         output_path: output_path.to_string(),
         total_html_files,
@@ -874,6 +901,40 @@ fn emit_progress_for_reporter(
     }
 }
 
+fn notify_translation_completed_dialog(
+    app: &tauri::AppHandle,
+    elapsed: std::time::Duration,
+    preview_only: bool,
+) {
+    let elapsed_text = format_elapsed_duration(elapsed);
+    let task_label = if preview_only {
+        "La vista previa"
+    } else {
+        "La traduccion"
+    };
+
+    app.dialog()
+        .message(format!(
+            "{} termino correctamente.\nTiempo total: {}",
+            task_label, elapsed_text
+        ))
+        .title("Traduccion completada")
+        .kind(MessageDialogKind::Info)
+        .buttons(MessageDialogButtons::Ok)
+        .show(|_| {});
+}
+
+fn format_elapsed_duration(elapsed: std::time::Duration) -> String {
+    let total_seconds = elapsed.as_secs_f32();
+    if total_seconds < 60.0 {
+        format!("{:.1} segundos", total_seconds)
+    } else {
+        let minutes = (total_seconds / 60.0).floor() as u64;
+        let seconds = total_seconds - (minutes as f32 * 60.0);
+        format!("{} min {:.1} s", minutes, seconds)
+    }
+}
+
 async fn translate_html_content(
     client: &Client,
     api_key: &str,
@@ -995,65 +1056,21 @@ async fn translate_html_in_blocks(
     let mut translated = String::with_capacity(html.len());
     let mut fallback_blocks = 0usize;
     for block in blocks {
-        match ai::translate_text_with_retry(
+        match translate_block_with_adaptive_splitting(
             client,
             api_key,
             target_language,
             block.as_str(),
-            MAX_RETRIES,
         )
-        .await
-        {
+        .await {
             Ok(chunk) => translated.push_str(&chunk),
             Err(err) => {
                 println!(
-                    "Warning: fallo bloque grande, intentando sub-bloques (error={})",
+                    "Warning: fallo bloque y se conserva original para evitar truncado (error={})",
                     err
                 );
-
-                let mut recovered = String::new();
-                let sub_tokens = tokenize_html(block.as_str());
-                let sub_blocks = split_html_into_blocks(
-                    &sub_tokens,
-                    RECOVERY_BLOCK_MIN_CHARS,
-                    RECOVERY_BLOCK_TARGET_CHARS,
-                    RECOVERY_BLOCK_MAX_CHARS,
-                );
-
-                if sub_blocks.is_empty() {
-                    fallback_blocks += 1;
-                    translated.push_str(block.as_str());
-                    continue;
-                }
-
-                for sub in sub_blocks {
-                    match ai::translate_text_with_retry(
-                        client,
-                        api_key,
-                        target_language,
-                        sub.as_str(),
-                        MAX_RETRIES,
-                    )
-                    .await
-                    {
-                        Ok(piece) => recovered.push_str(&piece),
-                        Err(sub_err) => {
-                            println!(
-                                "Warning: fallo sub-bloque, conservando sub-bloque original (error={})",
-                                sub_err
-                            );
-                            fallback_blocks += 1;
-                            recovered.push_str(sub.as_str());
-                        }
-                    }
-                }
-
-                if !recovered.is_empty() {
-                    translated.push_str(&recovered);
-                } else {
-                    fallback_blocks += 1;
-                    translated.push_str(block.as_str());
-                }
+                fallback_blocks += 1;
+                translated.push_str(block.as_str());
             }
         }
     }
@@ -1066,6 +1083,73 @@ async fn translate_html_in_blocks(
     }
 
     Ok((translated, consumed))
+}
+
+async fn translate_block_with_adaptive_splitting(
+    client: &Client,
+    api_key: &str,
+    target_language: &str,
+    block_html: &str,
+) -> Result<String, String> {
+    let mut pending_segments: VecDeque<(String, u8)> = VecDeque::new();
+    pending_segments.push_back((block_html.to_string(), 0));
+    let mut translated = String::with_capacity(block_html.len());
+
+    while let Some((segment, depth)) = pending_segments.pop_front() {
+        match ai::translate_text_with_retry(
+            client,
+            api_key,
+            target_language,
+            segment.as_str(),
+            MAX_RETRIES,
+        )
+        .await
+        {
+            Ok(piece) => translated.push_str(&piece),
+            Err(err) => {
+                if is_truncated_by_length_error(&err) && depth < ADAPTIVE_TRUNCATION_MAX_DEPTH {
+                    let split_segments = split_segment_for_truncation_retry(&segment, depth);
+                    if split_segments.len() > 1 {
+                        println!(
+                            "Warning: truncado por longitud, reduciendo tamano (nivel={}, partes={})",
+                            depth + 1,
+                            split_segments.len()
+                        );
+
+                        for split in split_segments.into_iter().rev() {
+                            pending_segments.push_front((split, depth + 1));
+                        }
+                        continue;
+                    }
+                }
+
+                return Err(err);
+            }
+        }
+    }
+
+    Ok(translated)
+}
+
+fn split_segment_for_truncation_retry(segment_html: &str, depth: u8) -> Vec<String> {
+    let segment_chars = segment_html.chars().count();
+    let adaptive_min = ADAPTIVE_TRUNCATION_MIN_CHARS.min(RECOVERY_BLOCK_MIN_CHARS);
+
+    if segment_chars < adaptive_min {
+        return Vec::new();
+    }
+
+    let divisor = depth as usize + 2;
+    let target = (segment_chars / divisor).clamp(adaptive_min, RECOVERY_BLOCK_TARGET_CHARS);
+    let min = (target / 2).clamp(adaptive_min, target);
+    let max = (target * 2).clamp(target, RECOVERY_BLOCK_MAX_CHARS);
+
+    let tokens = tokenize_html(segment_html);
+    split_html_into_blocks(&tokens, min, target, max)
+}
+
+fn is_truncated_by_length_error(error: &str) -> bool {
+    error.contains("TRUNCATED_BY_LENGTH")
 }
 
 async fn translate_text_preserving_whitespace(

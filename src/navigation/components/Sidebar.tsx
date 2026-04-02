@@ -2,9 +2,6 @@
 import { useTranslation } from "react-i18next";
 import {
   Navigation24Regular,
-  Book24Regular,
-  Settings24Regular,
-  Translate24Regular,
   Key24Regular,
 } from "@fluentui/react-icons";
 
@@ -41,19 +38,7 @@ export function Sidebar({ onOpenApiKey }: { onOpenApiKey: () => void }) {
         </button>
       </div>
 
-      {/* Navigation Links */}
-      <nav className="flex-1 py-4 flex flex-col gap-2 px-2">
-        <NavItem
-          icon={<Book24Regular />}
-          label={t("sidebar.library")}
-          isCollapsed={isCollapsed}
-        />
-        <NavItem
-          icon={<Translate24Regular />}
-          label={t("sidebar.translate")}
-          isCollapsed={isCollapsed}
-        />
-      </nav>
+      <div className="flex-1" />
 
       {/* Footer / Settings */}
       <div className="p-2 border-t border-slate-100 flex flex-col gap-2 relative">
@@ -72,11 +57,6 @@ export function Sidebar({ onOpenApiKey }: { onOpenApiKey: () => void }) {
           label={t("sidebar.apiKey") || "AI Key"}
           isCollapsed={isCollapsed}
           onClick={onOpenApiKey}
-        />
-        <NavItem
-          icon={<Settings24Regular />}
-          label={t("sidebar.settings")}
-          isCollapsed={isCollapsed}
         />
       </div>
     </aside>
