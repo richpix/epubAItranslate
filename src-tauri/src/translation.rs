@@ -40,12 +40,15 @@ const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 10;
 const DEFAULT_CONCURRENCY_WARMUP: usize = 6;
 const SUCCESS_STREAK_FOR_SCALE_UP: usize = 1;
 const MAX_RETRIES: u32 = 4;
+const MAX_RETRIES_FOR_DECODE_ERROR: u32 = 1;
+const MAX_DECODE_ERROR_FALLBACK_CHAPTERS: usize = 8;
 const SAFE_TAIL_HTML_FILES: usize = 0;
 const MAX_CONCURRENCY_ENV: &str = "EPUBTR_MAX_CONCURRENCY";
 const FULL_BLOCK_MIN_ENV: &str = "EPUBTR_FULL_BLOCK_MIN_CHARS";
 const FULL_BLOCK_TARGET_ENV: &str = "EPUBTR_FULL_BLOCK_TARGET_CHARS";
 const FULL_BLOCK_MAX_ENV: &str = "EPUBTR_FULL_BLOCK_MAX_CHARS";
 static TRANSLATION_RUN_ACTIVE: AtomicBool = AtomicBool::new(false);
+static BLOCK_TRANSLATION_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, String>>> = std::sync::OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -248,7 +251,7 @@ pub async fn translate_epub(
         .pool_max_idle_per_host(64)
         .tcp_nodelay(true)
         .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(90))
+        .timeout(Duration::from_secs(300))
         .build()
         .map_err(|e| format!("No se pudo inicializar cliente HTTP: {}", e))?;
 
@@ -516,6 +519,8 @@ pub async fn translate_epub(
         let mut pending = VecDeque::from(html_indices);
         let mut in_flight = FuturesUnordered::new();
         let mut retries: HashMap<usize, u32> = HashMap::new();
+        let mut decode_recovery_chapters: HashSet<usize> = HashSet::new();
+        let mut decode_fallback_chapters = 0usize;
         let max_concurrency = chunk_options.max_concurrent_requests.max(1);
         let mut active_concurrency = max_concurrency.min(DEFAULT_CONCURRENCY_WARMUP).max(1);
         let mut success_streak = 0usize;
@@ -532,8 +537,21 @@ pub async fn translate_epub(
                 let api_key = request.api_key.trim().to_string();
                 let target_language = language_label(&request.target_language).to_string();
                 let mut options = chunk_options;
+
+                if decode_recovery_chapters.contains(&chapter_index) {
+                    options.full_block_min_chars = TRUNCATION_RECOVERY_CHUNK_MIN_CHARS;
+                    options.full_block_target_chars = TRUNCATION_RECOVERY_CHUNK_TARGET_CHARS;
+                    options.full_block_max_chars = TRUNCATION_RECOVERY_CHUNK_MAX_CHARS;
+                    options.chunk_threshold_chars = 1;
+                    options.chunk_min_chars = TRUNCATION_RECOVERY_CHUNK_MIN_CHARS;
+                    options.chunk_target_chars = TRUNCATION_RECOVERY_CHUNK_TARGET_CHARS;
+                    options.max_chunk_chars = TRUNCATION_RECOVERY_CHUNK_MAX_CHARS;
+                }
+
                 if tail_safe_html_indices.contains(&chapter_index) {
-                    options.force_text_node_mode = true;
+                    options.full_block_min_chars = TRUNCATION_RECOVERY_CHUNK_MIN_CHARS;
+                    options.full_block_target_chars = TRUNCATION_RECOVERY_CHUNK_TARGET_CHARS;
+                    options.full_block_max_chars = TRUNCATION_RECOVERY_CHUNK_MAX_CHARS;
                 }
 
                 in_flight.push(async move {
@@ -561,6 +579,8 @@ pub async fn translate_epub(
                     translated_html_files += 1;
                     translated_characters += consumed_chars;
                     success_streak += 1;
+                    retries.remove(&chapter_index);
+                    decode_recovery_chapters.remove(&chapter_index);
 
                     if chunk_options.dynamic_rate_limit
                         && active_concurrency < max_concurrency
@@ -593,10 +613,23 @@ pub async fn translate_epub(
                 }
                 Err(err) => {
                     let retry_count = retries.get(&chapter_index).copied().unwrap_or(0);
+                    let is_decode_error = is_response_decode_error(&err);
+                    let retry_budget = if is_decode_error {
+                        MAX_RETRIES_FOR_DECODE_ERROR
+                    } else {
+                        MAX_RETRIES
+                    };
+                    let is_retryable =
+                        is_decode_error || is_rate_limit_error(&err) || is_transient_transport_error(&err);
+
                     if chunk_options.dynamic_rate_limit
-                        && is_rate_limit_error(&err)
-                        && retry_count < MAX_RETRIES
+                        && is_retryable
+                        && retry_count < retry_budget
                     {
+                        if is_decode_error {
+                            decode_recovery_chapters.insert(chapter_index);
+                        }
+
                         retries.insert(chapter_index, retry_count + 1);
                         pending.push_back(chapter_index);
                         success_streak = 0;
@@ -604,22 +637,40 @@ pub async fn translate_epub(
                             active_concurrency = active_concurrency.saturating_sub(1).max(1);
                         }
 
-                        let exponential = 2u64.pow(retry_count.min(4));
-                        let jitter_seed = (chapter_index as u64)
-                            ^ ((retry_count as u64 + 1) * 0x9E37_79B9_7F4A_7C15);
-                        let jitter = jitter_seed.rotate_left(17) % 5;
-                        let backoff_secs = (exponential + jitter).clamp(1, 30);
+                        let backoff_secs = if is_decode_error {
+                            1
+                        } else {
+                            let exponential = 2u64.pow(retry_count.min(4));
+                            let jitter_seed = (chapter_index as u64)
+                                ^ ((retry_count as u64 + 1) * 0x9E37_79B9_7F4A_7C15);
+                            let jitter = jitter_seed.rotate_left(17) % 5;
+                            (exponential + jitter).clamp(1, 30)
+                        };
                         tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
 
                         emit_progress(
                             &app,
                             TranslationProgressPayload {
                                 status: "processing".to_string(),
-                                message: format!(
-                                    "Rate limit, esperando {}s (concurrencia {})",
-                                    backoff_secs,
-                                    active_concurrency
-                                ),
+                                message: if is_decode_error {
+                                    format!(
+                                        "Respuesta invalida de DeepSeek, activando recovery por fragmentos y reintentando en {}s (concurrencia {})",
+                                        backoff_secs,
+                                        active_concurrency
+                                    )
+                                } else if is_rate_limit_error(&err) {
+                                    format!(
+                                        "Rate limit, esperando {}s (concurrencia {})",
+                                        backoff_secs,
+                                        active_concurrency
+                                    )
+                                } else {
+                                    format!(
+                                        "Error de red transitorio, reintentando en {}s (concurrencia {})",
+                                        backoff_secs,
+                                        active_concurrency
+                                    )
+                                },
                                 current_file: translated_html_files,
                                 total_files: html_total,
                                 percent: if html_total == 0 {
@@ -633,6 +684,56 @@ pub async fn translate_epub(
                         continue;
                     }
 
+                    if is_decode_error {
+                        if let Some(source_html) = original_html_contents.get(&chapter_index) {
+                            tx.send((chapter_index, source_html.to_string())).map_err(|_| {
+                                format!(
+                                    "Error traduciendo {} y no se pudo enviar fallback al writer: {}",
+                                    file_name, err
+                                )
+                            })?;
+
+                            retries.remove(&chapter_index);
+                            decode_recovery_chapters.remove(&chapter_index);
+
+                            translated_html_files += 1;
+                            fallback_html_files += 1;
+                            decode_fallback_chapters += 1;
+
+                            let percent = if html_total == 0 {
+                                100.0
+                            } else {
+                                (translated_html_files as f32 / html_total as f32) * 100.0
+                            };
+
+                            emit_progress(
+                                &app,
+                                TranslationProgressPayload {
+                                    status: "processing".to_string(),
+                                    message: format!(
+                                        "Advertencia: fallback original en {} por respuestas invalidas de DeepSeek",
+                                        file_name
+                                    ),
+                                    current_file: translated_html_files,
+                                    total_files: html_total,
+                                    percent,
+                                    translated_characters,
+                                },
+                            );
+
+                            if decode_fallback_chapters >= MAX_DECODE_ERROR_FALLBACK_CHAPTERS {
+                                return Err(format!(
+                                    "Se detuvo la traduccion para evitar consumo excesivo: DeepSeek devolvio respuestas invalidas en {} capitulos. Reintenta con menor concurrencia o mas tarde.",
+                                    decode_fallback_chapters
+                                ));
+                            }
+
+                            continue;
+                        }
+
+                        return Err(format!("Error traduciendo {}: {}", file_name, err));
+                    }
+
                     if let Some(source_html) = original_html_contents.get(&chapter_index) {
                         tx.send((chapter_index, source_html.to_string())).map_err(|_| {
                             format!(
@@ -640,6 +741,9 @@ pub async fn translate_epub(
                                 file_name, err
                             )
                         })?;
+
+                        retries.remove(&chapter_index);
+                        decode_recovery_chapters.remove(&chapter_index);
 
                         translated_html_files += 1;
                         fallback_html_files += 1;
@@ -777,6 +881,26 @@ fn build_file_options(meta: EntryMeta) -> zip::write::FileOptions {
 fn is_rate_limit_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("429") || lower.contains("rate limit") || lower.contains("too many requests")
+}
+
+fn is_response_decode_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("deepseek_response_body_decode_error")
+        || lower.contains("error decoding response body")
+        || lower.contains("respuesta invalida de deepseek")
+}
+
+fn is_transient_transport_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("error de red")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("connection reset")
+        || lower.contains("unexpected eof")
+        || lower.contains("error de deepseek 500")
+        || lower.contains("error de deepseek 502")
+        || lower.contains("error de deepseek 503")
+        || lower.contains("error de deepseek 504")
 }
 
 fn get_epub_reading_order(archive: &mut ZipArchive<File>) -> Result<Vec<String>, String> {
@@ -1127,27 +1251,79 @@ async fn translate_html_in_blocks(
         return Ok((html.to_string(), consumed));
     }
 
-    let mut translated = String::with_capacity(html.len());
     let mut fallback_blocks = 0usize;
-    for block in blocks {
-        match translate_block_with_adaptive_splitting(
-            client,
-            api_key,
-            target_language,
-            block.as_str(),
-        )
-        .await {
-            Ok(chunk) => translated.push_str(&chunk),
+    
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(3));
+    let mut futures = FuturesUnordered::new();
+    let num_blocks = blocks.len();
+
+    for (i, block) in blocks.into_iter().enumerate() {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        block.as_str().hash(&mut hasher);
+        let block_hash = hasher.finish();
+
+        let cached_translation = BLOCK_TRANSLATION_CACHE
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .get(&block_hash)
+            .cloned();
+
+        let client_cloned = client.clone();
+        let api_key_cloned = api_key.to_string();
+        let target_lang_cloned = target_language.to_string();
+        let semaphore_cloned = semaphore.clone();
+        
+        futures.push(async move {
+            if let Some(cached) = cached_translation {
+                return (i, block, Ok(cached));
+            }
+
+            let _permit = semaphore_cloned.acquire().await.unwrap();
+            let result = translate_block_with_adaptive_splitting(
+                &client_cloned,
+                &api_key_cloned,
+                &target_lang_cloned,
+                block.as_str(),
+            ).await;
+
+            if let Ok(ref text) = result {
+                BLOCK_TRANSLATION_CACHE
+                    .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap()
+                    .insert(block_hash, text.clone());
+            }
+
+            (i, block, result)
+        });
+    }
+
+    let mut results = vec![String::new(); num_blocks];
+
+    while let Some((i, original_block, result)) = futures.next().await {
+        match result {
+            Ok(chunk) => results[i] = chunk,
             Err(err) => {
+                if is_rate_limit_error(&err)
+                    || is_response_decode_error(&err)
+                    || is_transient_transport_error(&err)
+                {
+                    return Err(err);
+                }
+
                 println!(
                     "Warning: fallo bloque y se conserva original para evitar truncado (error={})",
                     err
                 );
                 fallback_blocks += 1;
-                translated.push_str(block.as_str());
+                results[i] = original_block;
             }
         }
     }
+
+    let translated = results.join("");
 
     if fallback_blocks > 0 {
         println!(

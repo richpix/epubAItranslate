@@ -4,7 +4,6 @@ use std::sync::{Mutex, OnceLock};
 
 use futures_util::StreamExt;
 use reqwest::Client;
-use serde::Deserialize;
 use serde_json::json;
 use tokio::time::{sleep, Duration};
 
@@ -15,22 +14,6 @@ const DEFAULT_OUTPUT_TOKENS_CAP: usize = 8_192;
 const MAX_OUTPUT_TOKENS_CAP: usize = 12_288;
 static SYSTEM_PROMPT_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
-#[derive(Debug, Deserialize)]
-struct ChatCompletionResponse {
-    choices: Vec<Choice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Choice {
-    message: ChatMessage,
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatMessage {
-    content: String,
-}
-
 #[tauri::command]
 pub async fn validate_api_key(api_key: String) -> Result<bool, String> {
     if api_key.trim().is_empty() {
@@ -39,13 +22,14 @@ pub async fn validate_api_key(api_key: String) -> Result<bool, String> {
 
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(300))
         .build()
         .map_err(|e| format!("No se pudo inicializar cliente HTTP: {}", e))?;
     let res = client
         .post("https://api.deepseek.com/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key.trim()))
         .header("Content-Type", "application/json")
+        .header("Accept-Encoding", "identity")
         .json(&json!({
             "model": "deepseek-chat",
             "messages": [
@@ -209,6 +193,7 @@ async fn translate_text_once(
         .post("https://api.deepseek.com/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
+        .header("Accept-Encoding", "identity")
         .json(&json!({
             "model": "deepseek-chat",
             "temperature": 0.1,
@@ -234,23 +219,11 @@ async fn translate_text_once(
         return Err(format!("Error de DeepSeek {}: {}", status, body));
     }
 
-    let payload: ChatCompletionResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Respuesta invalida de DeepSeek: {}", e))?;
+    let (translated, finish_reason) = extract_text_and_finish_reason_from_response(response).await?;
 
-    let first_choice = payload
-        .choices
-        .first()
-        .ok_or_else(|| "DeepSeek devolvio una respuesta sin opciones".to_string())?;
-
-    if matches!(first_choice.finish_reason.as_deref(), Some("length")) {
+    if matches!(finish_reason.as_deref(), Some("length")) {
         return Err("TRUNCATED_BY_LENGTH".to_string());
     }
-
-    let translated = Some(first_choice.message.content.trim().to_string())
-        .filter(|content| !content.is_empty())
-        .ok_or_else(|| "DeepSeek devolvio una traduccion vacia".to_string())?;
 
     validate_translation_output(text, &translated)?;
     Ok(translated)
@@ -275,6 +248,7 @@ async fn translate_text_streaming_once(
         .post("https://api.deepseek.com/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
+        .header("Accept-Encoding", "identity")
         .json(&json!({
             "model": "deepseek-chat",
             "temperature": 0.1,
@@ -494,6 +468,7 @@ async fn translate_text_once_strict_spanish(
         .post("https://api.deepseek.com/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
+        .header("Accept-Encoding", "identity")
         .json(&json!({
             "model": "deepseek-chat",
             "temperature": 0.1,
@@ -519,20 +494,96 @@ async fn translate_text_once_strict_spanish(
         return Err(format!("Error de DeepSeek {}: {}", status, body));
     }
 
-    let payload: ChatCompletionResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Respuesta invalida de DeepSeek: {}", e))?;
+    let (translated, finish_reason) = extract_text_and_finish_reason_from_response(response).await?;
 
-    let translated = payload
-        .choices
-        .first()
-        .map(|choice| choice.message.content.trim().to_string())
-        .filter(|content| !content.is_empty())
-        .ok_or_else(|| "DeepSeek devolvio una traduccion vacia".to_string())?;
+    if matches!(finish_reason.as_deref(), Some("length")) {
+        return Err("TRUNCATED_BY_LENGTH".to_string());
+    }
 
     validate_translation_output(text, &translated)?;
     Ok(translated)
+}
+
+async fn extract_text_and_finish_reason_from_response(
+    response: reqwest::Response,
+) -> Result<(String, Option<String>), String> {
+    let body_bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("DEEPSEEK_RESPONSE_BODY_DECODE_ERROR: {}", e))?;
+
+    let payload: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|e| {
+        let preview = safe_body_preview(&body_bytes, 280);
+        format!(
+            "Respuesta invalida de DeepSeek: {} (preview={})",
+            e, preview
+        )
+    })?;
+
+    let first_choice = payload
+        .get("choices")
+        .and_then(|choices| choices.as_array())
+        .and_then(|choices| choices.first())
+        .ok_or_else(|| "DeepSeek devolvio una respuesta sin opciones".to_string())?;
+
+    let finish_reason = first_choice
+        .get("finish_reason")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+
+    let translated = extract_text_from_choice(first_choice)
+        .ok_or_else(|| "DeepSeek devolvio una traduccion vacia".to_string())?;
+
+    Ok((translated, finish_reason))
+}
+
+fn extract_text_from_choice(choice: &serde_json::Value) -> Option<String> {
+    let as_string = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+
+    if let Some(text) = as_string(choice.get("text")) {
+        return Some(text);
+    }
+
+    let message_content = choice
+        .get("message")
+        .and_then(|message| message.get("content"));
+
+    if let Some(text) = as_string(message_content) {
+        return Some(text);
+    }
+
+    let content_array = message_content.and_then(|value| value.as_array())?;
+    let mut joined = String::new();
+
+    for item in content_array {
+        if let Some(text_piece) = item
+            .get("text")
+            .and_then(|value| value.as_str())
+            .or_else(|| item.as_str())
+        {
+            joined.push_str(text_piece);
+        }
+    }
+
+    let trimmed = joined.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn safe_body_preview(bytes: &[u8], max_chars: usize) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .take(max_chars)
+        .collect::<String>()
+        .replace('\n', "\\n")
 }
 
 fn should_retry_for_han(target_language: &str, translated: &str) -> bool {
@@ -568,7 +619,10 @@ fn is_cjk_han(ch: char) -> bool {
 }
 
 fn is_non_retryable_error(error: &str) -> bool {
-    error.contains("TRUNCATED_BY_LENGTH")
+    let lower = error.to_ascii_lowercase();
+    lower.contains("truncated_by_length")
+        || lower.contains("deepseek_response_body_decode_error")
+        || lower.contains("respuesta invalida de deepseek")
 }
 
 fn resolve_max_output_tokens(text: &str) -> usize {
