@@ -40,4 +40,4 @@ jobs:
           releaseBody: 'Descarga el DMG o instalador para Mac en los assets de esta versión.'
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.args }}
+          args: '--target universal-apple-darwin' # Compila un binario universal (Intel + M1/M2)
