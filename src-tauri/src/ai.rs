@@ -7,13 +7,17 @@ use reqwest::Client;
 use serde_json::json;
 use tokio::time::{sleep, Duration};
 
+// Constantes de configuración para la validación de traducciones y límites de tokens de salida.
 const MIN_CONTENT_CHARS_FOR_RATIO_CHECK: usize = 40;
 const MAX_OUTPUT_TOKENS_ENV: &str = "EPUBTR_MAX_OUTPUT_TOKENS";
 const MIN_OUTPUT_TOKENS: usize = 512;
 const DEFAULT_OUTPUT_TOKENS_CAP: usize = 8_192;
 const MAX_OUTPUT_TOKENS_CAP: usize = 12_288;
+// Caché estática en memoria para almacenar los prompts de sistema (system prompt) por idioma.
 static SYSTEM_PROMPT_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
+// Valida la clave de la API mediante una petición de prueba mínima al endpoint de DeepSeek.
+// Retorna Ok(true) si el servidor responde con éxito.
 #[tauri::command]
 pub async fn validate_api_key(api_key: String) -> Result<bool, String> {
     if api_key.trim().is_empty() {
@@ -54,6 +58,9 @@ pub async fn validate_api_key(api_key: String) -> Result<bool, String> {
     }
 }
 
+// Envía texto a DeepSeek aplicando una estrategia de reintentos exponencial (exponential backoff).
+// También posee un mecanismo de seguridad estricta para evitar la intrusión de caracteres chinos (han),
+// re-evaluando con un prompt reforzado (fallback stricto).
 pub async fn translate_text_with_retry(
     client: &Client,
     api_key: &str,
@@ -106,6 +113,9 @@ pub async fn translate_text_with_retry(
     }
 }
 
+// Envía texto a DeepSeek a través de SSE (Server-Sent Events) permitiendo recibir la traducción en stream (por chunks).
+// En caso de fallas de red, implementa un "exponential backoff" (aumentando la espera) hasta max_retries.
+// Si no hay el callback 'on_delta', retrocede silenciosamente al flujo asíncrono normal.
 pub async fn translate_text_with_retry_streaming(
     client: &Client,
     api_key: &str,
@@ -175,6 +185,9 @@ pub async fn translate_text_with_retry_streaming(
     }
 }
 
+// Emite una única petición REST al endpoint de completamiento de DeepSeek.
+// Calcula los tokens dinámicamente y se encarga de empaquetar una respuesta consolidada.
+// Falla de entrada si el texto base está vacío.
 async fn translate_text_once(
     client: &Client,
     api_key: &str,
@@ -229,6 +242,9 @@ async fn translate_text_once(
     Ok(translated)
 }
 
+// Envía una única petición de streaming activando "stream": true en DeepSeek.
+// Construye un buffer re-ensamblando cada "[DONE]" o "data: ..." con sus deltas de payload
+// Llamando a su vez el callback de actualización visual (on_delta).
 async fn translate_text_streaming_once(
     client: &Client,
     api_key: &str,
@@ -354,6 +370,9 @@ async fn translate_text_streaming_once(
     Ok(translated)
 }
 
+// Analiza la heurística del texto resultante frente a la fuente para detectar alteraciones graves
+// como respuestas vacías, envoltorios de código ("```"), inserción de etiquetas indeseadas
+// o relaciones desproporcionadas en el tamaño del texto.
 fn validate_translation_output(source: &str, translated: &str) -> Result<(), String> {
     let source_trimmed = source.trim();
     let translated_trimmed = translated.trim();
@@ -405,6 +424,8 @@ fn validate_translation_output(source: &str, translated: &str) -> Result<(), Str
     Ok(())
 }
 
+// Analiza linealmente una cadena para identificar estructuras similares a fragmentos XML (<.../>)
+// sin requerir un parser html completo.
 fn has_tag_like_fragment(input: &str) -> bool {
     let bytes = input.as_bytes();
     for idx in 0..bytes.len() {
@@ -427,6 +448,8 @@ fn has_tag_like_fragment(input: &str) -> bool {
     false
 }
 
+// Retorna un prompt estándar o extraído del caché interno si ya existe para este idioma.
+// Dicta explícitamente el rol, tono narrativo y tratamiento de formato HTML al modelo.
 fn get_system_prompt(target_language: &str) -> String {
     let cache = SYSTEM_PROMPT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache_guard = cache
@@ -446,6 +469,9 @@ fn get_system_prompt(target_language: &str) -> String {
     prompt
 }
 
+// Fallback estricto. Construye una ordenación más enérgica e incuestionable
+// para evitar caracteres orientales (han), de utilidad en contextos en que
+// la IA intercala ideogramas si desconoce un término local.
 async fn translate_text_once_strict_spanish(
     client: &Client,
     api_key: &str,
@@ -504,6 +530,8 @@ async fn translate_text_once_strict_spanish(
     Ok(translated)
 }
 
+// Intercepta e interpreta el body de la petición DeepSeek.
+// Extrae de forma segura el texto resultante así como la razón de finalización (finish_reason).
 async fn extract_text_and_finish_reason_from_response(
     response: reqwest::Response,
 ) -> Result<(String, Option<String>), String> {
@@ -537,6 +565,8 @@ async fn extract_text_and_finish_reason_from_response(
     Ok((translated, finish_reason))
 }
 
+// Analiza recursivamente diferentes formatos y estructuras de "choices" generados
+// por los Endpoints OpenAI compatibles para reunir sus fragmentos en texto crudo.
 fn extract_text_from_choice(choice: &serde_json::Value) -> Option<String> {
     let as_string = |value: Option<&serde_json::Value>| {
         value
@@ -578,6 +608,8 @@ fn extract_text_from_choice(choice: &serde_json::Value) -> Option<String> {
     }
 }
 
+// Genera un extracto de logs seguro con caracteres tomados mediante iterador "char"
+// evitando panics por partir el offset de bytes en el contorno de un carácter utf-8.
 fn safe_body_preview(bytes: &[u8], max_chars: usize) -> String {
     String::from_utf8_lossy(bytes)
         .chars()
@@ -586,6 +618,8 @@ fn safe_body_preview(bytes: &[u8], max_chars: usize) -> String {
         .replace('\n', "\\n")
 }
 
+// Condición de retraducción estricta: Analiza si existe indeseadamente
+// caracteres Han (chinos) en traducciones que apuntan a español.
 fn should_retry_for_han(target_language: &str, translated: &str) -> bool {
     if !is_spanish_target(target_language) {
         return false;
@@ -599,11 +633,13 @@ fn should_retry_for_han(target_language: &str, translated: &str) -> bool {
     han_count >= 3
 }
 
+// Verifica si la meta de origen de destino (en el prompt) declara explícitamente español.
 fn is_spanish_target(target_language: &str) -> bool {
     let normalized = target_language.to_ascii_lowercase();
     normalized.contains("espan") || normalized == "es"
 }
 
+// Devuelve verdadero si un carácter dado entra dentro del bloque del código Unicode extendido y unificado CJK (Ideogramas Orientales).
 fn is_cjk_han(ch: char) -> bool {
     matches!(
         ch as u32,
@@ -618,6 +654,9 @@ fn is_cjk_han(ch: char) -> bool {
     )
 }
 
+// Analiza descriptores de la clase de error para discernir aquellos irrecuperables
+// de aquellos red-asociados que sí ganarían provecho al reintentarse.
+// Evita bucles colmando la red cuando la entrada de por sí detona truncation, un json envenenado...
 fn is_non_retryable_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("truncated_by_length")
@@ -625,6 +664,8 @@ fn is_non_retryable_error(error: &str) -> bool {
         || lower.contains("respuesta invalida de deepseek")
 }
 
+// Determina dinámicamente cuántos max_tokens se deben declarar usando de métrica la densidad
+// original del extracto en número de caracteres, más un abanico holgado y seguro.
 fn resolve_max_output_tokens(text: &str) -> usize {
     if let Some(override_value) = read_env_usize(
         MAX_OUTPUT_TOKENS_ENV,
@@ -639,6 +680,8 @@ fn resolve_max_output_tokens(text: &str) -> usize {
     estimated.clamp(MIN_OUTPUT_TOKENS, DEFAULT_OUTPUT_TOKENS_CAP)
 }
 
+// Parsea numéricamente de forma segura el valor dentro de una clave del entorno global de rust.
+// Garantiza que la salida encaje dentro del intervalo configurado.
 fn read_env_usize(key: &str, min: usize, max: usize) -> Option<usize> {
     let raw = env::var(key).ok()?;
     let parsed = raw.trim().parse::<usize>().ok()?;

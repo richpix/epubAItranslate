@@ -179,6 +179,11 @@ impl ProgressReporter {
     }
 }
 
+// Punto de entrada principal (Comando Tauri) para iniciar el pipeline de traducción.
+// 1. Descomprime un archivo epub de origen.
+// 2. Extrae el orden de lectura recorriendo en XML 'container.xml' y el 'content.opf' para descubrir los ficheros html correctos del 'spine'.
+// 3. Levanta la concurrencia definida para enviar las partes (chunks/text/blocks) a DeepSeek.
+// 4. Comprime un nuevo .epub empaquetando cada fichero manteniendo la estructura original e insertando el HTML modificado.
 #[tauri::command]
 pub async fn translate_epub(
     app: tauri::AppHandle,
@@ -903,6 +908,9 @@ fn is_transient_transport_error(error: &str) -> bool {
         || lower.contains("error de deepseek 504")
 }
 
+// Lee y mapea la estructura interna del EPUB ('META-INF/container.xml' y el OPF)
+// para extraer el orden de lectura correcto de los capítulos y documentos (columna vertebral o "spine").
+// Si el EPUB no declara el orden correctamente el parser fallará para intentar con ordenación por nombres.
 fn get_epub_reading_order(archive: &mut ZipArchive<File>) -> Result<Vec<String>, String> {
     let mut file = archive
         .by_name("META-INF/container.xml")
@@ -1133,6 +1141,10 @@ fn format_elapsed_duration(elapsed: std::time::Duration) -> String {
     }
 }
 
+// Punto central para decidir cómo procesar una página HTML.
+// O bien utiliza el 'modo de bloque completo' (enviando porciones largas integrales al modelo)
+// o parsea iterativamente las etiquetas (tokeniza) y traduce de a poco (modo chunking)
+// manteniendo intactas las etiquetas estructurales.
 async fn translate_html_content(
     client: &Client,
     api_key: &str,
@@ -1228,6 +1240,10 @@ async fn translate_html_content(
     Ok((result, consumed_characters))
 }
 
+// Traduce grandes pedazos de HTML interconectados (bloques).
+// Esto reduce notablemente la cantidad de peticiones API realizadas.
+// Descompone la página en partes más pequeñas configurables (full_block_min/target/max_chars),
+// procesándolas en paralelo, re-ensamblándolas y gestionando bloqueos/rate-limits por la API.
 async fn translate_html_in_blocks(
     client: &Client,
     api_key: &str,
@@ -1335,6 +1351,10 @@ async fn translate_html_in_blocks(
     Ok((translated, consumed))
 }
 
+// Gestiona una retraducción adaptable ante errores "TRUNCATED_BY_LENGTH" (truncamiento).
+// Cuando un bloque devuelve sólo una mitad traducida (porque DeepSeek superó su límite de tokens),
+// este método subdivide el bloque en partes más pequeñas aún, hasta que el modelo devuelva todo correctamente.
+// Si llegamos a nivel máximo de división adaptiva y sigue truncándose, retrocede al modo seguro "text node recovery".
 async fn translate_block_with_adaptive_splitting(
     client: &Client,
     api_key: &str,
@@ -1418,6 +1438,9 @@ fn is_truncated_by_length_error(error: &str) -> bool {
     error.contains("TRUNCATED_BY_LENGTH")
 }
 
+// Modalidad de extrema supervivencia que se lanza cuando el modo principal fracasó y las adaptaciones de truncaje fallaron.
+// Tokeniza la fuente separando el HTML del texto y procesa individualmente solo las fracciones del texto libre detectado con Chunking,
+// devolviendo un nuevo ensamble ultra detallado y blindando de errores de formato.
 async fn translate_block_with_text_node_recovery(
     client: &Client,
     api_key: &str,
@@ -1485,6 +1508,10 @@ async fn translate_block_with_text_node_recovery(
     Ok(translated)
 }
 
+// Módulo especializado en la traducción de un hilo de texto sin descuidar ni mutar sus prefijos o sufijos 
+// invisibles (espacios, enter, tabulaciones), indispensables para ciertas estructuraciones HTML.
+// Segmenta internamente el contenido según oraciones naturales sí 'chunking' está activado
+// o realiza un parseo lineal entero directo si el bloque no supera los límites fijados de tokens.
 async fn translate_text_preserving_whitespace(
     client: &Client,
     api_key: &str,
@@ -1700,6 +1727,9 @@ fn count_translatable_text_chars(tokens: &[HtmlToken]) -> usize {
     total
 }
 
+// Corta amigablemente el texto grande localizando oraciones completas y evitando romper su naturalidad semántica.
+// Detecta puntos finales, signos de exclamación o de interrogación que terminen idealmente la locución 
+// en las proximidades del target character predefinido.
 fn split_text_by_sentence(
     text: &str,
     min_chars: usize,
@@ -1749,6 +1779,9 @@ fn split_text_by_sentence(
     segments
 }
 
+// Divide lógicamente el HTML de un archivo grande en secciones/bloques autónomos (generalmente correspondientes 
+// con párrafos o divs enteros). Considera seguras las divisiones solo sí terminan en etiquetas de cierre naturales,
+// salvo llegar a rebasar el umbral estricto por sobre "max_chars".
 fn split_html_into_blocks(
     tokens: &[HtmlToken],
     min_chars: usize,
@@ -1826,6 +1859,10 @@ fn split_at_char_count(input: &str, char_count: usize) -> (&str, &str) {
     (&input[..split_index], &input[split_index..])
 }
 
+// Iterador simple pero eficaz que clasifica fragmentos de HTML entre dos tipos fijos:
+// 'HtmlTokenKind::Tag': Porciones de texto encapsuladas en `<` y `>`.
+// 'HtmlTokenKind::Text': Todo lo recidual externo a etiquetas.
+// Evita el uso de Regex por rendimiento en miles de páginas renderizadas.
 fn tokenize_html(html: &str) -> Vec<HtmlToken> {
     let mut tokens = Vec::new();
 

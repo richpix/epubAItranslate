@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { load } from "@tauri-apps/plugin-store";
 import { invoke } from "@tauri-apps/api/core";
 
+// Componente modal para gestionar la persistencia y lectura de la API Key
 export function ApiKeyModal({
   isOpen,
   onClose,
@@ -17,12 +18,14 @@ export function ApiKeyModal({
   const [isValidating, setIsValidating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+// Carga la clave API almacenada cuando el modal se abre
   useEffect(() => {
     if (isOpen) {
       loadStore();
     }
   }, [isOpen]);
 
+// Función asincrónica para obtener la API key desde el almacenamiento tauri-store
   const loadStore = async () => {
     try {
       const store = await load(".config.dat");
@@ -35,7 +38,9 @@ export function ApiKeyModal({
     }
   };
 
+// Procesa el guardado en disco si la API key es válida
   const handleSave = async () => {
+// Evita claves en blanco o compuestas solo por espacios
     if (!apiKey.trim()) {
       setError(t("modal.errorEmpty"));
       return;
@@ -44,8 +49,10 @@ export function ApiKeyModal({
     setError(null);
 
     try {
+// Llama al backend en Rust para la validación antes de conservar permanentemente el valor
       const isValid = await invoke("validate_api_key", { apiKey });
       if (isValid) {
+// Almacena y persiste la nueva clave
         const store = await load(".config.dat");
         await store.set("deepseek_api_key", apiKey);
         await store.save();
@@ -55,12 +62,14 @@ export function ApiKeyModal({
         setError(t("modal.errorInvalid"));
       }
     } catch (err: any) {
+// Despliega error local si falló el guardado o validación
       setError(err.toString());
     } finally {
       setIsValidating(false);
     }
   };
 
+// Maneja el borrado de la clave almacenada
   const handleDelete = async () => {
     try {
       const store = await load(".config.dat");
@@ -74,6 +83,7 @@ export function ApiKeyModal({
     }
   };
 
+// No renderiza nada si el estado isOpen es falso
   if (!isOpen) return null;
 
   return (

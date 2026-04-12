@@ -30,14 +30,18 @@ const LANGUAGE_OPTIONS: LanguageOption[] = [
   { code: "es", label: "Español" },
 ];
 
+// Función auxiliar para generar la ruta de salida por defecto basada en el idioma de destino
 function defaultOutputPath(inputPath: string, lang: string): string {
   const lower = inputPath.toLowerCase();
+// Si el archivo de entrada no es un epub válido retorna un sufijo simple
   if (!lower.endsWith(".epub")) {
     return `${inputPath}_${lang}.epub`;
   }
+// Devuelve la ruta eliminando la extensión y añadiendo el sufijo de idioma
   return `${inputPath.slice(0, -5)}_${lang}.epub`;
 }
 
+// Componente principal para el panel de traducción
 export function TranslationPanel({
   apiKey,
   hasApiKey,
@@ -49,9 +53,11 @@ export function TranslationPanel({
 }) {
   const { t } = useTranslation();
 
+// Estados locales para la ruta de entrada, salida y el idioma a traducir
   const [inputPath, setInputPath] = useState("");
   const [outputPath, setOutputPath] = useState("");
   const [targetLanguage, setTargetLanguage] = useState("es");
+// Estados misceláneos de la IU
   const [isTranslating, setIsTranslating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -66,6 +72,7 @@ export function TranslationPanel({
 
   const translatedModeLabel = t("translation.fullModeHint");
 
+// Abre un selector de archivos nativo para elegir el EPUB de entrada
   const pickInputEpub = async () => {
     const selected = await open({
       multiple: false,
@@ -82,6 +89,7 @@ export function TranslationPanel({
     setSuccessMessage(null);
   };
 
+// Abre un selector de archivos nativo para guardar el archivo traducido
   const pickOutputEpub = async () => {
     const selected = await save({
       defaultPath: outputPath || defaultOutputPath(inputPath || "translated", targetLanguage),
@@ -92,6 +100,7 @@ export function TranslationPanel({
       return;
     }
 
+// Normaliza el nombre del archivo si no tiene extensión epub
     const normalized = selected.toLowerCase().endsWith(".epub")
       ? selected
       : `${selected}.epub`;
@@ -100,7 +109,9 @@ export function TranslationPanel({
     setError(null);
   };
 
+// Inicia el proceso de traducción con el backend en Rust
   const startTranslation = async () => {
+// Validación de las dependencias antes de empezar
     if (!hasApiKey) {
       setError(t("translation.errors.noApiKey"));
       return;
@@ -122,6 +133,7 @@ export function TranslationPanel({
     let unlisten: (() => void) | null = null;
 
     try {
+// Escucha el evento de progreso para mostrar el porcentaje en la IU
       unlisten = await listen<TranslationProgressPayload>(
         "translation-progress",
         (event) => {
@@ -129,6 +141,7 @@ export function TranslationPanel({
         },
       );
 
+// Invoca el comando al hilo principal (backend) pasando los datos de la tarea
       const result = await invoke<TranslateResult>("translate_epub", {
         request: {
           inputPath,
@@ -139,6 +152,7 @@ export function TranslationPanel({
         },
       });
 
+// Al completarse, notifica en la IU el éxito del proceso
       setSuccessMessage(
         t("translation.success", {
           outputPath: result.outputPath,
@@ -147,8 +161,10 @@ export function TranslationPanel({
         }),
       );
     } catch (translationError) {
+// Despliega cualquier error proveniente del backend
       setError(String(translationError));
     } finally {
+// Limpieza de estados y eventos
       unlisten?.();
       setIsTranslating(false);
     }

@@ -5,10 +5,12 @@ import {
   Key24Regular,
 } from "@fluentui/react-icons";
 
+// Componente para la barra lateral de navegación (Sidebar)
 export function Sidebar({ onOpenApiKey }: { onOpenApiKey: () => void }) {
   const { t, i18n } = useTranslation();
   const [isCollapsed, setIsCollapsed] = useState(false);
 
+// Función para alternar el idioma entre Español y el previamente soportado (Inglés por defecto como base de i18n)
   const toggleLanguage = () => {
     const nextLang = i18n.language.startsWith("es") ? "en" : "es";
     i18n.changeLanguage(nextLang);
@@ -63,6 +65,7 @@ export function Sidebar({ onOpenApiKey }: { onOpenApiKey: () => void }) {
   );
 }
 
+// Componente secundario para definir y renderizar ítems listados en el Sidebar
 function NavItem({
   icon,
   label,

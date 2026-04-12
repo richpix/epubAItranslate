@@ -6,15 +6,18 @@ import { ApiKeyModal } from "./navigation/components/ApiKeyModal";
 import { TranslationPanel } from "./components/TranslationPanel";
 import "./App.css";
 
+// Componente raíz de la aplicación web
 function App() {
   const { t } = useTranslation();
   const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState(false);
   const [apiKey, setApiKey] = useState<string | null>(null);
 
+// Carga asincrónica de la API key al montar el componente
   useEffect(() => {
     void loadApiKey();
   }, []);
 
+// Función de carga de API key almacenada en Tauri Store
   const loadApiKey = async () => {
     try {
       const store = await load(".config.dat");
@@ -49,6 +52,7 @@ function App() {
         isOpen={isApiKeyModalOpen}
         onClose={() => setIsApiKeyModalOpen(false)}
         onApiKeyChanged={() => {
+// Recarga la vista si la API Key cambia
           void loadApiKey();
         }}
       />
