@@ -142,27 +142,26 @@ Key points:
 npm install
 ```
 
-### Ejecutar en desarrollo
+### Run in development mode
 
 ```bash
 npm run tauri dev
 ```
 
-### Build de produccion
+### Production build
 
 ```bash
 npm run tauri build
 ```
 
-### Verificacion backend Rust
+### Backend Rust check
 
 ```bash
 cd src-tauri
 cargo check
 ```
 
-## Estructura resumida
-
+## Project structure (simplified)
 ```text
 src/
 	App.tsx
@@ -177,11 +176,13 @@ src-tauri/
 	tauri.conf.json
 ```
 
-## Notas operativas
+## Operational notes
 
-- Actualmente el flujo principal es traduccion de libro completo.
-- El pipeline prioriza robustez y completitud del EPUB antes que velocidad maxima agresiva.
-- Las optimizaciones de rendimiento deben mantener:
-	- orden de capitulos,
-	- preservacion de estructura,
-	- fallback seguro ante errores de red/modelo.
+-The main flow is currently full‑book translation.
+
+-The pipeline prioritizes EPUB completeness and robustness over aggressive speed.
+
+-Performance optimizations must preserve:
+ chapter order,
+ structural integrity,
+ safe fallback on network/model errors.
