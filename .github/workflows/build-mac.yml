@@ -6,38 +6,94 @@ on:
       - 'v*'
 
 permissions:
-  contents: write # Permiso necesario para crear el Release en GitHub
+  contents: write
 
 jobs:
-  build-mac:
-    runs-on: macos-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true # Quita la advertencia de Node.js
+  # 1️⃣ Crear un draft release una sola vez (evita condiciones de carrera)
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create_release.outputs.release_id }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - name: Create draft release
+        id: create_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --draft \
+            --title "Release ${{ github.ref_name }}" \
+            --generate-notes
+          RELEASE_ID=$(gh release view "${{ github.ref_name }}" --json id -q '.id')
+          echo "release_id=$RELEASE_ID" >> $GITHUB_OUTPUT
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+  # 2️⃣ macOS → un job por arquitectura (Intel y Apple Silicon)
+  build-mac:
+    needs: create-release
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-apple-darwin   # Mac Intel
+          - aarch64-apple-darwin  # Mac Apple Silicon
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
-
-      - name: Install frontend dependencies
-        run: npm install
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - run: npm install
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
-
-      - name: Build Tauri for Mac
-        uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }} 
-          releaseName: 'Release ${{ github.ref_name }}'
-          releaseBody: 'Descarga el DMG o instalador para Mac en los assets de esta versión.'
-          releaseDraft: true
-          prerelease: false
-          args: '--target universal-apple-darwin' # Compila un binario universal (Intel + M1/M2)
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: '--target ${{ matrix.target }}'
+
+  # 3️⃣ Windows (x64)
+  build-windows:
+    needs: create-release
+    runs-on: windows-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+
+  # 4️⃣ Linux (x64)
+  build-linux:
+    needs: create-release
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - name: Instalar dependencias de sistema para Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
