@@ -1,44 +1,50 @@
 # EPUBTR
 
-Aplicacion de escritorio para traducir libros EPUB con IA, construida con Tauri (Rust) + React (TypeScript).
+[![Tauri](https://img.shields.io/badge/Tauri-2.0-FFC131?style=flat-square&logo=tauri&logoColor=white)](https://tauri.app)
+[![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react)](https://react.dev)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org)
+[![Rust](https://img.shields.io/badge/Rust-1.77+-DEA584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Vite](https://img.shields.io/badge/Vite-7-646CFF?style=flat-square&logo=vite&logoColor=white)](https://vitejs.dev)
+[![Tailwind CSS](https://img.shields.io/badge/Tailwind_CSS-4-38B2AC?style=flat-square&logo=tailwind-css&logoColor=white)](https://tailwindcss.com)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](./LICENSE)
 
-## Que hace el proyecto
+Desktop application to translate EPUB books using AI, built with **Tauri (Rust)** + **React (TypeScript)**.
 
-- Abre un archivo `.epub`.
-- Traduce el contenido HTML capitulo por capitulo usando DeepSeek.
-- Conserva estructura EPUB (spine, imagenes, CSS y archivos no HTML).
-- Escribe un EPUB de salida manteniendo el orden de lectura.
+## What the project does
 
-## Arquitectura general
+- Opens an `.epub` file.
+- Translates the HTML content chapter by chapter via **DeepSeek**.
+- Preserves the EPUB structure (spine, images, CSS, and non‑HTML files).
+- Outputs a fully readable EPUB while keeping the original reading order.
+
+## General architecture
 
 ### Frontend (React + TypeScript)
 
-- UI principal: `src/App.tsx`
-- Panel de traduccion: `src/components/TranslationPanel.tsx`
-- Modal de API key: `src/navigation/components/ApiKeyModal.tsx`
+- Main UI: `src/App.tsx`
+- Translation panel: `src/components/TranslationPanel.tsx`
+- API key modal: `src/navigation/components/ApiKeyModal.tsx`
 - i18n: `src/i18n/config.ts`
 
-Responsabilidades del frontend:
-
-- Seleccionar archivo de entrada/salida.
-- Gestionar API key.
-- Invocar comandos Tauri.
-- Mostrar progreso de traduccion en tiempo real.
+Responsibilities:
+- Select input/output file.
+- Manage API key.
+- Invoke Tauri commands.
+- Show real‑time translation progress.
 
 ### Backend (Rust + Tauri)
 
-- Registro de comandos: `src-tauri/src/lib.rs`
-- Pipeline EPUB: `src-tauri/src/translation.rs`
-- Cliente IA (DeepSeek): `src-tauri/src/ai.rs`
+- Command registration: `src-tauri/src/lib.rs`
+- EPUB pipeline: `src-tauri/src/translation.rs`
+- AI client (DeepSeek): `src-tauri/src/ai.rs`
 
-Responsabilidades del backend:
+Responsibilities:
+- Read and parse EPUB (ZIP + OPF/spine).
+- Run concurrent HTML translation.
+- Handle retries, truncation control, and fallbacks.
+- Write the final ordered, complete EPUB.
 
-- Leer y parsear EPUB (ZIP + OPF/spine).
-- Ejecutar traduccion concurrente de HTML.
-- Aplicar reintentos, control de truncado y fallbacks.
-- Escribir EPUB final ordenado y completo.
-
-## Tecnologias usadas
+## Technologies used
 
 ### Frontend
 
@@ -46,75 +52,75 @@ Responsabilidades del backend:
 - TypeScript 5
 - Vite 7
 - Tailwind CSS 4
-- i18next + react-i18next
+- i18next + react‑i18next
 - Tauri JS API (`@tauri-apps/api`)
-- Plugins Tauri frontend:
-	- `@tauri-apps/plugin-dialog`
-	- `@tauri-apps/plugin-store`
+- Tauri plugins:
+  - `@tauri-apps/plugin-dialog`
+  - `@tauri-apps/plugin-store`
 
-### Backend Rust
+### Rust Backend
 
-- `tauri` (comandos e integracion desktop)
+- `tauri` – commands and desktop integration
 - `tauri-plugin-dialog`
 - `tauri-plugin-store`
-- `reqwest` (cliente HTTP para DeepSeek)
-- `tokio` (async y backoff)
-- `futures-util` (pool de futures concurrentes)
-- `zip` (lectura/escritura EPUB)
-- `quick-xml` (parseo de container.xml y OPF/spine)
-- `serde` / `serde_json` (serializacion)
+- `reqwest` – HTTP client for DeepSeek
+- `tokio` – async runtime, backoff, concurrency
+- `futures-util` – concurrent future pool
+- `zip` – EPUB read/write (ZIP container)
+- `quick-xml` – parsing `container.xml` and OPF/spine
+- `serde` / `serde_json` – serialization
 
-## Librerias Rust clave y por que se usan
+## Key Rust libraries and why
 
-- `zip`: EPUB es un contenedor ZIP. Se usa para leer entradas y reconstruir salida.
-- `quick-xml`: parseo robusto de XML EPUB (`container.xml` y `content.opf`).
-- `reqwest`: llamadas HTTP a DeepSeek, incluyendo modo streaming/no-streaming.
-- `tokio`: espera async, reintentos exponenciales y control de concurrencia.
-- `futures-util`: `FuturesUnordered` para ejecutar varios capitulos en paralelo.
+- **`zip`** – EPUB is a ZIP container; used to read entries and rebuild the output.
+- **`quick-xml`** – robust XML parser for `container.xml` and `content.opf`.
+- **`reqwest`** – HTTP calls to DeepSeek, both streaming and non‑streaming modes.
+- **`tokio`** – async waiting, exponential retries, concurrency control.
+- **`futures-util`** – `FuturesUnordered` for parallel chapter translation.
 
-## Logica multihilo de traduccion EPUB
+## Multithreaded EPUB translation logic
 
-El flujo de libro completo usa un patron productor-consumidor:
+The full‑book flow uses a **producer‑consumer** pattern:
 
-1. **Productor async (traduccion)**
-	 - Toma indices de capitulos HTML.
-	 - Traduce en paralelo con concurrencia dinamica.
-	 - Envia resultados al canal como `(indice, html_traducido)`.
+1. **Async producer (translation)**
+   - Takes indices of HTML chapters.
+   - Translates in parallel with dynamic concurrency.
+   - Sends results to a channel as `(index, translated_html)`.
 
-2. **Consumidor dedicado (writer thread)**
-	 - Hilo separado para escritura ZIP.
-	 - Recibe resultados fuera de orden y los bufferiza.
-	 - Escribe al ZIP solo cuando llega el `expected_index`.
-	 - Garantiza orden correcto del EPUB de salida.
+2. **Dedicated consumer (writer thread)**
+   - A separate thread handles ZIP writing.
+   - Receives out‑of‑order results and buffers them.
+   - Writes to the ZIP only when the `expected_index` arrives.
+   - Guarantees the correct order in the output EPUB.
 
-3. **Fallback seguro**
-	 - Si un capitulo falla, se puede conservar HTML original para no truncar el archivo final.
-	 - Si el canal se cierra inesperadamente, el writer mantiene completitud del EPUB.
+3. **Safe fallback**
+   - If a chapter fails, the original HTML can be kept to avoid truncation.
+   - If the channel closes unexpectedly, the writer still produces a complete EPUB.
 
-## Logica de traduccion y control de calidad
+## Translation logic and quality control
 
-- Deteccion de truncado por `finish_reason = "length"`.
-- Division adaptativa de bloques HTML ante truncado.
-- Recovery por nodos de texto para segmentos complejos.
-- Validaciones de salida traducida:
-	- no vacia,
-	- sin bloques de codigo,
-	- consistencia basica de etiquetas,
-	- ratio de longitud razonable.
+- Truncation detection via `finish_reason = "length"`.
+- Adaptive HTML block splitting on truncation.
+- Text‑node recovery for complex segments.
+- Translated output validations:
+  - not empty,
+  - no code blocks,
+  - basic tag consistency,
+  - reasonable length ratio.
 
-## Compatibilidad Windows y macOS
+## Windows and macOS compatibility
 
-El proyecto esta orientado a funcionar en ambos sistemas en desarrollo y build local.
+The project is designed to run on both systems during development and local builds.
 
-Puntos clave:
+Key points:
 
-- Tauri v2 con `bundle.targets = "all"`.
-- Iconos presentes para ambos sistemas:
-	- `src-tauri/icons/icon.ico` (Windows)
-	- `src-tauri/icons/icon.icns` (macOS)
-- Manejo de rutas de entrada/salida en backend con validaciones de seguridad.
+- Tauri v2 with `bundle.targets = "all"`.
+- Icons present for both platforms:
+  - `src-tauri/icons/icon.ico` (Windows)
+  - `src-tauri/icons/icon.icns` (macOS)
+- Path handling in the backend with security validations.
 
-## Variables de entorno utiles
+## Useful environment variables
 
 - `EPUBTR_MAX_CONCURRENCY`
 - `EPUBTR_FULL_BLOCK_MIN_CHARS`
@@ -122,15 +128,15 @@ Puntos clave:
 - `EPUBTR_FULL_BLOCK_MAX_CHARS`
 - `EPUBTR_MAX_OUTPUT_TOKENS`
 
-## Desarrollo local
+## Local development
 
-### Requisitos
+### Prerequisites
 
 - Node.js 18+
-- Rust toolchain estable
-- Dependencias de Tauri segun tu OS
+- Stable Rust toolchain
+- Tauri system dependencies (see [Tauri docs](https://tauri.app/start/prerequisites/))
 
-### Instalar dependencias
+### Install dependencies
 
 ```bash
 npm install
