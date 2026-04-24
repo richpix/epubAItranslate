@@ -9,37 +9,14 @@ permissions:
   contents: write
 
 jobs:
-  # 1️⃣ Crear un draft release una sola vez (evita condiciones de carrera)
-  create-release:
-    runs-on: ubuntu-latest
-    outputs:
-      release_id: ${{ steps.create_release.outputs.release_id }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Create draft release
-        id: create_release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "${{ github.ref_name }}" \
-            --draft \
-            --title "Release ${{ github.ref_name }}" \
-            --generate-notes
-          RELEASE_ID=$(gh release view "${{ github.ref_name }}" --json id -q '.id')
-          echo "release_id=$RELEASE_ID" >> $GITHUB_OUTPUT
-
-  # 2️⃣ macOS → un job por arquitectura (Intel y Apple Silicon)
   build-mac:
-    needs: create-release
     runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
         target:
-          - x86_64-apple-darwin   # Mac Intel
-          - aarch64-apple-darwin  # Mac Apple Silicon
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -53,15 +30,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          releaseId: ${{ needs.create-release.outputs.release_id }}
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Release ${{ github.ref_name }}'
+          releaseDraft: true
+          prerelease: false
           args: '--target ${{ matrix.target }}'
 
-  # 3️⃣ Windows (x64)
   build-windows:
-    needs: create-release
     runs-on: windows-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -73,21 +49,20 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          releaseId: ${{ needs.create-release.outputs.release_id }}
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Release ${{ github.ref_name }}'
+          releaseDraft: true
+          prerelease: false
 
-  # 4️⃣ Linux (x64)
   build-linux:
-    needs: create-release
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
       - run: npm install
-      - name: Instalar dependencias de sistema para Tauri
+      - name: Instalar dependencias de sistema
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
@@ -96,4 +71,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          releaseId: ${{ needs.create-release.outputs.release_id }}
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Release ${{ github.ref_name }}'
+          releaseDraft: true
+          prerelease: false
+
+  publish-release:
+    needs: [build-mac, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${{ github.ref_name }}" \
+            --draft=false \
+            --repo ${{ github.repository }}
