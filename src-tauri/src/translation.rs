@@ -57,6 +57,8 @@ pub struct TranslateEpubRequest {
     pub output_path: String,
     pub target_language: String,
     pub api_key: String,
+    pub provider: String,
+    pub model: String,
     pub preview_only: bool,
     pub preview_pages: Option<u32>,
 }
@@ -94,8 +96,10 @@ struct HtmlToken {
     value: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct TranslationChunkOptions {
+    provider: String,
+    model: String,
     enable_chunking: bool,
     chunk_threshold_chars: usize,
     chunk_min_chars: usize,
@@ -290,6 +294,8 @@ pub async fn translate_epub(
         full_block_target_chars.clamp(full_block_min_chars, full_block_max_chars);
 
     let chunk_options = TranslationChunkOptions {
+        provider: request.provider.clone(),
+        model: request.model.clone(),
         enable_chunking: !request.preview_only,
         chunk_threshold_chars: CHAPTER_TOKEN_THRESHOLD * APPROX_CHARS_PER_TOKEN,
         chunk_min_chars: CHUNK_MIN_CHARS,
@@ -541,7 +547,7 @@ pub async fn translate_epub(
                 let client = client.clone();
                 let api_key = request.api_key.trim().to_string();
                 let target_language = language_label(&request.target_language).to_string();
-                let mut options = chunk_options;
+                let mut options = chunk_options.clone();
 
                 if decode_recovery_chapters.contains(&chapter_index) {
                     options.full_block_min_chars = TRUNCATION_RECOVERY_CHUNK_MIN_CHARS;
@@ -1300,6 +1306,8 @@ async fn translate_html_in_blocks(
             let result = translate_block_with_adaptive_splitting(
                 &client_cloned,
                 &api_key_cloned,
+                options.provider.as_str(),
+                options.model.as_str(),
                 &target_lang_cloned,
                 block.as_str(),
             ).await;
@@ -1358,6 +1366,8 @@ async fn translate_html_in_blocks(
 async fn translate_block_with_adaptive_splitting(
     client: &Client,
     api_key: &str,
+    provider: &str,
+    model: &str,
     target_language: &str,
     block_html: &str,
 ) -> Result<String, String> {
@@ -1369,6 +1379,8 @@ async fn translate_block_with_adaptive_splitting(
         match ai::translate_text_with_retry(
             client,
             api_key,
+            provider,
+            model,
             target_language,
             segment.as_str(),
             MAX_RETRIES,
@@ -1401,6 +1413,8 @@ async fn translate_block_with_adaptive_splitting(
                         translate_block_with_text_node_recovery(
                             client,
                             api_key,
+                            provider,
+                            model,
                             target_language,
                             segment.as_str(),
                         )
@@ -1444,10 +1458,14 @@ fn is_truncated_by_length_error(error: &str) -> bool {
 async fn translate_block_with_text_node_recovery(
     client: &Client,
     api_key: &str,
+    provider: &str,
+    model: &str,
     target_language: &str,
     block_html: &str,
 ) -> Result<String, String> {
     let recovery_options = TranslationChunkOptions {
+        provider: provider.to_string(),
+        model: model.to_string(),
         enable_chunking: true,
         chunk_threshold_chars: 1,
         chunk_min_chars: TRUNCATION_RECOVERY_CHUNK_MIN_CHARS,
@@ -1565,6 +1583,8 @@ async fn translate_text_preserving_whitespace(
                     translate_text(
                         client,
                         api_key,
+                        options.provider.as_str(),
+                        options.model.as_str(),
                         target_language,
                         head,
                         options,
@@ -1572,7 +1592,7 @@ async fn translate_text_preserving_whitespace(
                     )
                     .await?
                 } else {
-                    translate_text(client, api_key, target_language, head, options, None).await?
+                    translate_text(client, api_key, options.provider.as_str(), options.model.as_str(), target_language, head, options, None).await?
                 }
             };
 
@@ -1625,6 +1645,8 @@ async fn translate_text_preserving_whitespace(
                     translate_text(
                         client,
                         api_key,
+                        options.provider.as_str(),
+                        options.model.as_str(),
                         target_language,
                         chunk,
                         options,
@@ -1632,7 +1654,17 @@ async fn translate_text_preserving_whitespace(
                     )
                     .await?
                 } else {
-                    translate_text(client, api_key, target_language, chunk, options, None).await?
+                    translate_text(
+                        client,
+                        api_key,
+                        options.provider.as_str(),
+                        options.model.as_str(),
+                        target_language,
+                        chunk,
+                        options,
+                        None,
+                    )
+                    .await?
                 }
             };
 
@@ -1660,6 +1692,8 @@ async fn translate_text_preserving_whitespace(
             translate_text(
                 client,
                 api_key,
+                options.provider.as_str(),
+                options.model.as_str(),
                 target_language,
                 &input_to_translate,
                 options,
@@ -1670,6 +1704,8 @@ async fn translate_text_preserving_whitespace(
             translate_text(
                 client,
                 api_key,
+                options.provider.as_str(),
+                options.model.as_str(),
                 target_language,
                 &input_to_translate,
                 options,
@@ -1689,6 +1725,8 @@ async fn translate_text_preserving_whitespace(
 async fn translate_text(
     client: &Client,
     api_key: &str,
+    provider: &str,
+    model: &str,
     target_language: &str,
     text: &str,
     options: &TranslationChunkOptions,
@@ -1698,6 +1736,8 @@ async fn translate_text(
         ai::translate_text_with_retry_streaming(
             client,
             api_key,
+            provider,
+            model,
             target_language,
             text,
             MAX_RETRIES,
@@ -1705,7 +1745,7 @@ async fn translate_text(
         )
         .await
     } else {
-        ai::translate_text_with_retry(client, api_key, target_language, text, MAX_RETRIES).await
+        ai::translate_text_with_retry(client, api_key, provider, model, target_language, text, MAX_RETRIES).await
     }
 }
 

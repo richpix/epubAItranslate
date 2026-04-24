@@ -6,8 +6,11 @@
     "apiKey": "AI Key"
   },
   "modal": {
-    "apiKeyTitle": "DeepSeek API Key",
-    "apiKeyPlaceholder": "Enter your DeepSeek API key",
+    "apiKeyTitle": "AI provider settings",
+    "providerLabel": "Provider",
+    "modelLabel": "Model",
+    "fixedModel": "Fixed model for this provider: {{model}}",
+    "apiKeyPlaceholder": "Enter the API key for the selected provider",
     "save": "Save",
     "cancel": "Cancel",
     "deleteKey": "Delete Key",
@@ -17,14 +20,14 @@
   },
   "home": {
     "title": "EPUB Translator",
-    "description": "Translate your EPUB books with AI quickly and accurately.",
+    "description": "Translate your EPUB books with AI quickly and accurately (DeepSeek, Gemini, or OpenAI).",
     "content": "Select a file, configure the output, and run the full translation from this screen."
   },
   "translation": {
     "title": "Translate EPUB",
     "description": "Pick a .epub file, choose a language, and export the translated file.",
     "targetLanguage": "Target language",
-    "moreLanguagesSoon": "This list is extensible. The MVP starts with Spanish.",
+    "moreLanguagesSoon": "Choose the target language or keep it in Spanish.",
     "mode": "Translation mode",
     "fullMode": "Full book",
     "fullModeHint": "Translate the entire book chapter by chapter.",

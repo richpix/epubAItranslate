@@ -1,7 +1,19 @@
 import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
-import { load } from "@tauri-apps/plugin-store";
 import { invoke } from "@tauri-apps/api/core";
+import {
+  DEEPSEEK_MODELS,
+  DEFAULT_AI_CONFIG,
+  GEMINI_MODEL,
+  OPENAI_MODEL,
+  type AiConfig,
+  type AiProvider,
+} from "../../types/ai";
+import {
+  clearAiConfigInStore,
+  loadAiConfigFromStore,
+  saveAiConfigToStore,
+} from "../../utils/aiConfig";
 
 // Componente modal para gestionar la persistencia y lectura de la API Key
 export function ApiKeyModal({
@@ -14,7 +26,9 @@ export function ApiKeyModal({
   onApiKeyChanged?: () => void;
 }) {
   const { t } = useTranslation();
-  const [apiKey, setApiKey] = useState("");
+  const [provider, setProvider] = useState<AiProvider>(DEFAULT_AI_CONFIG.provider);
+  const [apiKey, setApiKey] = useState(DEFAULT_AI_CONFIG.apiKey);
+  const [model, setModel] = useState<AiConfig["model"]>(DEFAULT_AI_CONFIG.model);
   const [isValidating, setIsValidating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -28,15 +42,21 @@ export function ApiKeyModal({
 // Función asincrónica para obtener la API key desde el almacenamiento tauri-store
   const loadStore = async () => {
     try {
-      const store = await load(".config.dat");
-      const savedKey: string | null | undefined = await store.get("deepseek_api_key");
-      if (savedKey) {
-        setApiKey(savedKey);
-      }
+      const config = await loadAiConfigFromStore();
+      if (!config) return;
+      setProvider(config.provider);
+      setApiKey(config.apiKey);
+      setModel(config.model);
     } catch (err) {
       console.error("Failed to load store", err);
     }
   };
+
+  const effectiveModel = provider === "deepseek"
+    ? model
+    : provider === "gemini"
+      ? GEMINI_MODEL
+      : OPENAI_MODEL;
 
 // Procesa el guardado en disco si la API key es válida
   const handleSave = async () => {
@@ -50,12 +70,17 @@ export function ApiKeyModal({
 
     try {
 // Llama al backend en Rust para la validación antes de conservar permanentemente el valor
-      const isValid = await invoke("validate_api_key", { apiKey });
+      const isValid = await invoke<boolean>("validate_api_key", {
+        provider,
+        apiKey,
+        model: effectiveModel,
+      });
       if (isValid) {
-// Almacena y persiste la nueva clave
-        const store = await load(".config.dat");
-        await store.set("deepseek_api_key", apiKey);
-        await store.save();
+        await saveAiConfigToStore({
+          provider,
+          apiKey,
+          model: effectiveModel,
+        });
         onApiKeyChanged?.();
         onClose();
       } else {
@@ -72,10 +97,10 @@ export function ApiKeyModal({
 // Maneja el borrado de la clave almacenada
   const handleDelete = async () => {
     try {
-      const store = await load(".config.dat");
-      await store.delete("deepseek_api_key");
-      await store.save();
-      setApiKey("");
+      await clearAiConfigInStore();
+      setProvider(DEFAULT_AI_CONFIG.provider);
+      setApiKey(DEFAULT_AI_CONFIG.apiKey);
+      setModel(DEFAULT_AI_CONFIG.model);
       onApiKeyChanged?.();
       onClose();
     } catch (err) {
@@ -92,6 +117,48 @@ export function ApiKeyModal({
         <h2 className="text-xl font-bold mb-4 text-slate-900">
           {t("modal.apiKeyTitle")}
         </h2>
+        <label className="block text-sm font-medium text-slate-700 mb-1">
+          {t("modal.providerLabel")}
+        </label>
+        <select
+          className="w-full p-2 border border-slate-300 rounded mb-3 focus:outline-none focus:ring-2 focus:ring-blue-500 text-slate-900"
+          value={provider}
+          onChange={(e) => {
+            const nextProvider = e.target.value as AiProvider;
+            setProvider(nextProvider);
+            if (nextProvider === "deepseek" && !DEEPSEEK_MODELS.includes(model as (typeof DEEPSEEK_MODELS)[number])) {
+              setModel(DEEPSEEK_MODELS[0]);
+            }
+          }}
+          disabled={isValidating}
+        >
+          <option value="deepseek">DeepSeek</option>
+          <option value="gemini">Gemini</option>
+          <option value="openai">OpenAI</option>
+        </select>
+        {provider === "deepseek" ? (
+          <>
+            <label className="block text-sm font-medium text-slate-700 mb-1">
+              {t("modal.modelLabel")}
+            </label>
+            <select
+              className="w-full p-2 border border-slate-300 rounded mb-3 focus:outline-none focus:ring-2 focus:ring-blue-500 text-slate-900"
+              value={model}
+              onChange={(e) => setModel(e.target.value as AiConfig["model"])}
+              disabled={isValidating}
+            >
+              {DEEPSEEK_MODELS.map((deepseekModel) => (
+                <option key={deepseekModel} value={deepseekModel}>
+                  {deepseekModel}
+                </option>
+              ))}
+            </select>
+          </>
+        ) : (
+          <p className="text-xs text-slate-500 mb-3">
+            {t("modal.fixedModel", { model: effectiveModel })}
+          </p>
+        )}
         <input
           type="password"
           className="w-full p-2 border border-slate-300 rounded mb-4 focus:outline-none focus:ring-2 focus:ring-blue-500 text-slate-900"

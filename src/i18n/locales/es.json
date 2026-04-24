@@ -6,8 +6,11 @@
     "apiKey": "Clave IA"
   },
   "modal": {
-    "apiKeyTitle": "Clave API de DeepSeek",
-    "apiKeyPlaceholder": "Introduce tu clave API de DeepSeek",
+    "apiKeyTitle": "Configuración de proveedor IA",
+    "providerLabel": "Proveedor",
+    "modelLabel": "Modelo",
+    "fixedModel": "Modelo fijo para este proveedor: {{model}}",
+    "apiKeyPlaceholder": "Introduce tu clave API del proveedor seleccionado",
     "save": "Guardar",
     "cancel": "Cancelar",
     "deleteKey": "Eliminar Clave",
@@ -17,14 +20,14 @@
   },
   "home": {
     "title": "Traductor de EPUB",
-    "description": "Traduce tus libros EPUB con IA de forma rapida y precisa.",
+    "description": "Traduce tus libros EPUB con IA de forma rapida y precisa (DeepSeek, Gemini u OpenAI).",
     "content": "Selecciona un archivo, configura la salida y ejecuta la traduccion completa desde esta pantalla."
   },
   "translation": {
     "title": "Traducir EPUB",
     "description": "Selecciona un .epub, elige idioma y exporta el archivo traducido.",
     "targetLanguage": "Idioma de destino",
-    "moreLanguagesSoon": "La lista es extensible. Por ahora el MVP usa Español.",
+    "moreLanguagesSoon": "Elige el idioma de salida o manténlo en español.",
     "mode": "Modo de traducción",
     "fullMode": "Libro completo",
     "fullModeHint": "Traduce el libro completo capítulo por capítulo.",

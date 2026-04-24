@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { useTranslation } from "react-i18next";
+import type { AiConfig } from "../types/ai";
 
 type TranslationProgressPayload = {
   status: string;
@@ -43,11 +44,11 @@ function defaultOutputPath(inputPath: string, lang: string): string {
 
 // Componente principal para el panel de traducción
 export function TranslationPanel({
-  apiKey,
+  aiConfig,
   hasApiKey,
   onOpenApiKey,
 }: {
-  apiKey: string | null;
+  aiConfig: AiConfig | null;
   hasApiKey: boolean;
   onOpenApiKey: () => void;
 }) {
@@ -148,7 +149,9 @@ export function TranslationPanel({
           outputPath,
           targetLanguage,
           previewOnly: false,
-          apiKey: apiKey ?? "",
+          apiKey: aiConfig?.apiKey ?? "",
+          provider: aiConfig?.provider ?? "deepseek",
+          model: aiConfig?.model ?? "deepseek-v4-pro",
         },
       });
 

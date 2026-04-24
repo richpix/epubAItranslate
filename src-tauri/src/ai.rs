@@ -13,36 +13,65 @@ const MAX_OUTPUT_TOKENS_ENV: &str = "EPUBTR_MAX_OUTPUT_TOKENS";
 const MIN_OUTPUT_TOKENS: usize = 512;
 const DEFAULT_OUTPUT_TOKENS_CAP: usize = 8_192;
 const MAX_OUTPUT_TOKENS_CAP: usize = 12_288;
+const GEMINI_MODEL: &str = "gemini-3.1-flash-lite-preview";
+const OPENAI_MODEL: &str = "gpt-5.4-nano";
+const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-v4-pro";
+const DEEPSEEK_ALT_MODEL: &str = "deepseek-v4-flash";
 // Caché estática en memoria para almacenar los prompts de sistema (system prompt) por idioma.
 static SYSTEM_PROMPT_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
-// Valida la clave de la API mediante una petición de prueba mínima al endpoint de DeepSeek.
+// Valida la clave de la API mediante una petición de prueba mínima al endpoint.
 // Retorna Ok(true) si el servidor responde con éxito.
 #[tauri::command]
-pub async fn validate_api_key(api_key: String) -> Result<bool, String> {
+pub async fn validate_api_key(api_key: String, provider: String, model: String) -> Result<bool, String> {
     if api_key.trim().is_empty() {
         return Err("La API key no puede estar vacia".to_string());
     }
+
+    let provider_norm = normalize_provider(provider.as_str());
+    let model_norm = normalize_model(provider_norm.as_str(), model.as_str());
 
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(300))
         .build()
         .map_err(|e| format!("No se pudo inicializar cliente HTTP: {}", e))?;
-    let res = client
-        .post("https://api.deepseek.com/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key.trim()))
-        .header("Content-Type", "application/json")
-        .header("Accept-Encoding", "identity")
-        .json(&json!({
-            "model": "deepseek-chat",
-            "messages": [
-                {"role": "user", "content": "Hello"}
-            ],
-            "max_tokens": 1
-        }))
-        .send()
-        .await;
+    let res = if provider_norm == "gemini" {
+        let endpoint = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            model_norm,
+            api_key.trim()
+        );
+        client
+            .post(endpoint)
+            .header("Content-Type", "application/json")
+            .json(&json!({
+                "contents": [{
+                    "parts": [{"text": "Hello"}]
+                }]
+            }))
+            .send()
+            .await
+    } else {
+        let endpoint = match provider_norm.as_str() {
+            "openai" => "https://api.openai.com/v1/chat/completions",
+            _ => "https://api.deepseek.com/chat/completions",
+        };
+        client
+            .post(endpoint)
+            .header("Authorization", format!("Bearer {}", api_key.trim()))
+            .header("Content-Type", "application/json")
+            .header("Accept-Encoding", "identity")
+            .json(&json!({
+                "model": model_norm,
+                "messages": [
+                    {"role": "user", "content": "Hello"}
+                ],
+                "max_tokens": 1
+            }))
+            .send()
+            .await
+    };
 
     match res {
         Ok(response) => {
@@ -64,6 +93,8 @@ pub async fn validate_api_key(api_key: String) -> Result<bool, String> {
 pub async fn translate_text_with_retry(
     client: &Client,
     api_key: &str,
+    provider: &str,
+    model: &str,
     target_language: &str,
     text: &str,
     max_retries: u32,
@@ -73,12 +104,14 @@ pub async fn translate_text_with_retry(
     let sanitized_api_key = api_key.trim();
 
     loop {
-        match translate_text_once(client, sanitized_api_key, target_language, text).await {
+        match translate_text_once(client, sanitized_api_key, provider, model, target_language, text).await {
             Ok(translated) => {
                 if should_retry_for_han(target_language, &translated) {
                     match translate_text_once_strict_spanish(
                         client,
                         sanitized_api_key,
+                        provider,
+                        model,
                         target_language,
                         text,
                     )
@@ -119,6 +152,8 @@ pub async fn translate_text_with_retry(
 pub async fn translate_text_with_retry_streaming(
     client: &Client,
     api_key: &str,
+    provider: &str,
+    model: &str,
     target_language: &str,
     text: &str,
     max_retries: u32,
@@ -133,6 +168,8 @@ pub async fn translate_text_with_retry_streaming(
             match translate_text_streaming_once(
                 client,
                 sanitized_api_key,
+                provider,
+                model,
                 target_language,
                 text,
                 Some(on_delta),
@@ -161,6 +198,8 @@ pub async fn translate_text_with_retry_streaming(
         match translate_text_streaming_once(
             client,
             sanitized_api_key,
+            provider,
+            model,
             target_language,
             text,
             None,
@@ -191,6 +230,8 @@ pub async fn translate_text_with_retry_streaming(
 async fn translate_text_once(
     client: &Client,
     api_key: &str,
+    provider: &str,
+    model: &str,
     target_language: &str,
     text: &str,
 ) -> Result<String, String> {
@@ -198,17 +239,36 @@ async fn translate_text_once(
         return Ok(text.to_string());
     }
 
+    let provider_norm = normalize_provider(provider);
+    let model_norm = normalize_model(provider_norm.as_str(), model);
     let system_prompt = get_system_prompt(target_language);
-
     let max_tokens = resolve_max_output_tokens(text);
 
+    if provider_norm == "gemini" {
+        let translated = translate_gemini_once(
+            client,
+            api_key,
+            model_norm.as_str(),
+            system_prompt.as_str(),
+            text,
+        )
+        .await?;
+        validate_translation_output(text, &translated)?;
+        return Ok(translated);
+    }
+
+    let endpoint = match provider_norm.as_str() {
+        "openai" => "https://api.openai.com/v1/chat/completions",
+        _ => "https://api.deepseek.com/chat/completions",
+    };
+
     let response = client
-        .post("https://api.deepseek.com/chat/completions")
+        .post(endpoint)
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .header("Accept-Encoding", "identity")
         .json(&json!({
-            "model": "deepseek-chat",
+            "model": model_norm,
             "temperature": 0.1,
             "max_tokens": max_tokens,
             "messages": [
@@ -229,7 +289,7 @@ async fn translate_text_once(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("Error de DeepSeek {}: {}", status, body));
+        return Err(format!("Error del proveedor {} ({}): {}", provider_norm, status, body));
     }
 
     let (translated, finish_reason) = extract_text_and_finish_reason_from_response(response).await?;
@@ -248,6 +308,8 @@ async fn translate_text_once(
 async fn translate_text_streaming_once(
     client: &Client,
     api_key: &str,
+    provider: &str,
+    model: &str,
     target_language: &str,
     text: &str,
     mut on_delta: Option<&mut (dyn FnMut(&str) + Send)>,
@@ -256,17 +318,39 @@ async fn translate_text_streaming_once(
         return Ok(text.to_string());
     }
 
+    let provider_norm = normalize_provider(provider);
+    let model_norm = normalize_model(provider_norm.as_str(), model);
     let system_prompt = get_system_prompt(target_language);
-
     let max_tokens = resolve_max_output_tokens(text);
 
+    if provider_norm == "gemini" {
+        let translated = translate_gemini_once(
+            client,
+            api_key,
+            model_norm.as_str(),
+            system_prompt.as_str(),
+            text,
+        )
+        .await?;
+        if let Some(callback) = on_delta.as_deref_mut() {
+            callback(translated.as_str());
+        }
+        validate_translation_output(text, &translated)?;
+        return Ok(translated);
+    }
+
+    let endpoint = match provider_norm.as_str() {
+        "openai" => "https://api.openai.com/v1/chat/completions",
+        _ => "https://api.deepseek.com/chat/completions",
+    };
+
     let response = client
-        .post("https://api.deepseek.com/chat/completions")
+        .post(endpoint)
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .header("Accept-Encoding", "identity")
         .json(&json!({
-            "model": "deepseek-chat",
+            "model": model_norm,
             "temperature": 0.1,
             "max_tokens": max_tokens,
             "stream": true,
@@ -288,7 +372,7 @@ async fn translate_text_streaming_once(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("Error de DeepSeek {}: {}", status, body));
+        return Err(format!("Error del proveedor {} ({}): {}", provider_norm, status, body));
     }
 
     let mut buffer = String::new();
@@ -317,7 +401,7 @@ async fn translate_text_streaming_once(
 
                 let json_value: serde_json::Value =
                     serde_json::from_str(payload).map_err(|e| {
-                        format!("Respuesta streaming invalida de DeepSeek: {}", e)
+                        format!("Respuesta streaming invalida del proveedor {}: {}", provider_norm, e)
                     })?;
 
                 if let Some(reason) = json_value
@@ -475,6 +559,8 @@ fn get_system_prompt(target_language: &str) -> String {
 async fn translate_text_once_strict_spanish(
     client: &Client,
     api_key: &str,
+    provider: &str,
+    model: &str,
     target_language: &str,
     text: &str,
 ) -> Result<String, String> {
@@ -488,15 +574,29 @@ async fn translate_text_once_strict_spanish(
         target_language
     );
 
+    let provider_norm = normalize_provider(provider);
+    let model_norm = normalize_model(provider_norm.as_str(), model);
+
+    if provider_norm == "gemini" {
+        let translated = translate_gemini_once(client, api_key, model_norm.as_str(), strict_prompt.as_str(), text).await?;
+        validate_translation_output(text, &translated)?;
+        return Ok(translated);
+    }
+
     let max_tokens = resolve_max_output_tokens(text);
 
+    let endpoint = match provider_norm.as_str() {
+        "openai" => "https://api.openai.com/v1/chat/completions",
+        _ => "https://api.deepseek.com/chat/completions",
+    };
+
     let response = client
-        .post("https://api.deepseek.com/chat/completions")
+        .post(endpoint)
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .header("Accept-Encoding", "identity")
         .json(&json!({
-            "model": "deepseek-chat",
+            "model": model_norm,
             "temperature": 0.1,
             "max_tokens": max_tokens,
             "messages": [
@@ -517,7 +617,7 @@ async fn translate_text_once_strict_spanish(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("Error de DeepSeek {}: {}", status, body));
+        return Err(format!("Error de {} ({}): {}", provider_norm, status, body));
     }
 
     let (translated, finish_reason) = extract_text_and_finish_reason_from_response(response).await?;
@@ -616,6 +716,89 @@ fn safe_body_preview(bytes: &[u8], max_chars: usize) -> String {
         .take(max_chars)
         .collect::<String>()
         .replace('\n', "\\n")
+}
+
+fn normalize_provider(provider: &str) -> String {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "gemini" => "gemini".to_string(),
+        "openai" => "openai".to_string(),
+        _ => "deepseek".to_string(),
+    }
+}
+
+fn normalize_model(provider: &str, requested_model: &str) -> String {
+    match provider {
+        "gemini" => GEMINI_MODEL.to_string(),
+        "openai" => OPENAI_MODEL.to_string(),
+        _ => {
+            let model = requested_model.trim();
+            if model == DEEPSEEK_DEFAULT_MODEL || model == DEEPSEEK_ALT_MODEL {
+                model.to_string()
+            } else {
+                DEEPSEEK_DEFAULT_MODEL.to_string()
+            }
+        }
+    }
+}
+
+async fn translate_gemini_once(
+    client: &Client,
+    api_key: &str,
+    model: &str,
+    system_prompt: &str,
+    text: &str,
+) -> Result<String, String> {
+    let endpoint = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        model, api_key
+    );
+
+    let prompt = format!("{}\n\nTexto:\n{}", system_prompt, text);
+
+    let response = client
+        .post(endpoint)
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "contents": [{
+                "parts": [{ "text": prompt }]
+            }]
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Error de red: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Error de Gemini ({}): {}", status, body));
+    }
+
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Respuesta invalida de Gemini: {}", e))?;
+
+    let mut output = String::new();
+    if let Some(parts) = payload
+        .get("candidates")
+        .and_then(|candidates| candidates.get(0))
+        .and_then(|candidate| candidate.get("content"))
+        .and_then(|content| content.get("parts"))
+        .and_then(|parts| parts.as_array())
+    {
+        for part in parts {
+            if let Some(text_piece) = part.get("text").and_then(|value| value.as_str()) {
+                output.push_str(text_piece);
+            }
+        }
+    }
+
+    let trimmed = output.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Gemini devolvio una traduccion vacia".to_string());
+    }
+
+    Ok(trimmed)
 }
 
 // Condición de retraducción estricta: Analiza si existe indeseadamente
