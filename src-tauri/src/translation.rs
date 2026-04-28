@@ -1173,7 +1173,15 @@ async fn translate_html_content(
     let mut skip_tag_depth = 0usize;
     let mut budget_exhausted = false;
     let total_text_chars = count_translatable_text_chars(&tokens);
-    let enable_chunking = options.enable_chunking && total_text_chars > options.chunk_threshold_chars;
+    // Ajusta el umbral de chunking para CJK: caracteres Han ≈ 1 token
+    // en lugar de ≈ 4 (alfabeto latino). Así el chunking arranca a ~10K
+    // tokens reales en ambos casos.
+    let effective_chunk_threshold = if ai::is_mostly_cjk(html) {
+        CHAPTER_TOKEN_THRESHOLD
+    } else {
+        options.chunk_threshold_chars
+    };
+    let enable_chunking = options.enable_chunking && total_text_chars > effective_chunk_threshold;
     let progress_label = if let Some(active_reporter) = reporter {
         format!("Traduciendo {}", active_reporter.file_name)
     } else {
@@ -1263,11 +1271,19 @@ async fn translate_html_in_blocks(
         return Ok((html.to_string(), 0));
     }
 
+    // Para texto CJK reduce los bloques proporcionalmente: cada Han ≈ 1 token,
+    // mientras que el alfabeto latino ≈ 4 chars/token. Mantiene el mismo
+    // presupuesto de tokens por bloque en ambos casos y evita truncamientos.
+    let block_divisor = if ai::is_mostly_cjk(html) { APPROX_CHARS_PER_TOKEN } else { 1 };
+    let block_min = (options.full_block_min_chars / block_divisor).max(3_000);
+    let block_target = (options.full_block_target_chars / block_divisor).max(5_000);
+    let block_max = (options.full_block_max_chars / block_divisor).max(8_000);
+
     let blocks = split_html_into_blocks(
         &tokens,
-        options.full_block_min_chars,
-        options.full_block_target_chars,
-        options.full_block_max_chars,
+        block_min,
+        block_target,
+        block_max,
     );
     if blocks.is_empty() {
         return Ok((html.to_string(), consumed));
@@ -1791,7 +1807,8 @@ fn split_text_by_sentence(
             char_count += 1;
             let idx = start + offset;
 
-            if matches!(ch, '.' | '!' | '?' | '\n') {
+            if matches!(ch, '.' | '!' | '?' | '\n' | '\u{3002}' | '\u{FF01}' | '\u{FF1F}') {
+                // \u{3002}=。 \u{FF01}=！ \u{FF1F}=？ (puntuación CJK)
                 last_sentence_end = Some(idx + ch.len_utf8());
             }
 

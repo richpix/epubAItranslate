@@ -801,6 +801,29 @@ async fn translate_gemini_once(
     Ok(trimmed)
 }
 
+// Detecta si un bloque de texto es predominantemente CJK (chino, japonés, coreano en Han).
+// Muestrea los primeros 3000 caracteres para decidir.
+pub fn is_mostly_cjk(text: &str) -> bool {
+    let sample: String = text.chars().take(3000).collect();
+    let total = sample.chars().count();
+    if total < 50 {
+        return false;
+    }
+    let cjk_count = sample.chars().filter(|ch| is_cjk_han(*ch)).count();
+    // Si > 25 % de los caracteres son Han, trata como CJK
+    cjk_count * 4 > total
+}
+
+// Razón estimada de caracteres por token según el alfabeto.
+// Para CJK: ~1 char/token. Para alfabetos latinos: ~4 chars/token.
+pub fn chars_per_token_ratio(text: &str) -> usize {
+    if is_mostly_cjk(text) {
+        1
+    } else {
+        4
+    }
+}
+
 // Condición de retraducción estricta: Analiza si existe indeseadamente
 // caracteres Han (chinos) en traducciones que apuntan a español.
 fn should_retry_for_han(target_language: &str, translated: &str) -> bool {
@@ -823,7 +846,7 @@ fn is_spanish_target(target_language: &str) -> bool {
 }
 
 // Devuelve verdadero si un carácter dado entra dentro del bloque del código Unicode extendido y unificado CJK (Ideogramas Orientales).
-fn is_cjk_han(ch: char) -> bool {
+pub fn is_cjk_han(ch: char) -> bool {
     matches!(
         ch as u32,
         0x4E00..=0x9FFF
@@ -859,7 +882,10 @@ fn resolve_max_output_tokens(text: &str) -> usize {
     }
 
     let chars = text.chars().count();
-    let estimated = (chars * 7) / 20 + 256;
+    // Ajusta la ratio según densidad CJK: caracteres Han ≈ 1 token,
+    // la traducción al español expande y necesita más tokens de salida.
+    let ratio_num: usize = if is_mostly_cjk(text) { 11 } else { 7 };
+    let estimated = (chars * ratio_num) / 20 + 256;
     estimated.clamp(MIN_OUTPUT_TOKENS, DEFAULT_OUTPUT_TOKENS_CAP)
 }
 

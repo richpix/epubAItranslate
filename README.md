@@ -120,6 +120,19 @@ Key points:
   - `src-tauri/icons/icon.icns` (macOS)
 - Path handling in the backend with security validations.
 
+## API key usage
+
+The application requires an API key from one of the supported AI providers (DeepSeek, Gemini, or OpenAI) to perform translations.
+
+### How it works
+
+1. **Enter your key** – Open the sidebar and click the **AI Key** button to open the configuration modal.
+2. **Validation** – Before saving, the key is validated by making a test request to the selected provider's API. Only valid keys are persisted.
+3. **Storage** – The API key is stored **locally on your machine** using [Tauri's plugin-store](https://v2.tauri.app/plugin/store/), which saves it to an OS-level secure configuration file (`.config.dat`). The key is **never sent to any server other than the AI provider you selected**, and it is **never uploaded, logged, or stored on any remote server** by this application.
+4. **Clear** – You can remove the stored key at any time from the same modal.
+
+> **Privacy guarantee:** Your API key stays on your device. It is only used to authenticate requests directly to the AI provider you choose (DeepSeek, Google Gemini, or OpenAI). No third party has access to it.
+
 ## Useful environment variables
 
 - `EPUBTR_MAX_CONCURRENCY`
