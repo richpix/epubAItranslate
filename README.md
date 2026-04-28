@@ -13,7 +13,7 @@ Desktop application to translate EPUB books using AI (Gemini, OpenAI, Deepseek),
 ## What the project does
 
 - Opens an `.epub` file.
-- Translates the HTML content chapter by chapter via **DeepSeek**.
+- Translates the HTML content chapter by chapter via **DeepSeek**, **Gemini**, **OpenAI** .
 - Preserves the EPUB structure (spine, images, CSS, and non‑HTML files).
 - Outputs a fully readable EPUB while keeping the original reading order.
 
