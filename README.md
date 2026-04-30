@@ -1,3 +1,5 @@
+**English** | [**Español**](README.es.md)
+
 # EPUBTR
 
 [![Tauri](https://img.shields.io/badge/Tauri-2.0-FFC131?style=flat-square&logo=tauri&logoColor=white)](https://tauri.app)
@@ -78,24 +80,55 @@ Responsibilities:
 - **`tokio`** – async waiting, exponential retries, concurrency control.
 - **`futures-util`** – `FuturesUnordered` for parallel chapter translation.
 
+## Rust code highlights
+
+### Concurrency & parallelism
+
+- **Async future pool** with `FuturesUnordered` — dozens of chapter translations run concurrently on the tokio runtime without spawning OS threads.
+- **Adaptive AIMD congestion control** — concurrency auto-scales from 6 up to 10 based on success rate; it increases on success streaks and decreases on errors, mimicking TCP congestion control.
+- **Semaphore‑gated parallelism** — within a single chapter, up to 3 HTML blocks are translated in parallel using a `tokio::sync::Semaphore(3)`, preventing API overload while maximizing throughput.
+- **Producer‑consumer architecture** — an async tokio producer sends translated chapters through an `mpsc` channel to a **dedicated OS thread** that writes the ZIP file, keeping the synchronous `zip` crate off the async runtime.
+- **Reorder buffer** — the writer thread holds a `HashMap<usize, String>` to reassemble out‑of‑order results, writing to the ZIP only when `expected_index` arrives.
+
+### Resilience & retries
+
+- **Two‑layer retry**: AI‑level exponential backoff (doubling delay up to 10 s) + chapter‑level exponential backoff with **deterministic jitter** (hash‑based per chapter index) to prevent thundering herd on mass retries.
+- **Three‑tier error classification**: non‑retryable (truncation, decode errors), rate‑limit (429), transient transport (timeout, 5xx) — each with a different recovery path.
+- **Graceful degradation chain**: full‑block mode → adaptive splitting (up to 3 levels) → text‑node recovery → keep original HTML (guarantees EPUB integrity).
+
+### Caching
+
+- **System prompt cache** (`OnceLock<Mutex<HashMap>>`) — system prompts are generated once per target language and reused across all API calls.
+- **Block translation cache** (`OnceLock<Mutex<HashMap<u64, String>>>`) — identical HTML blocks (e.g. repeated headers/footers) are translated only once and reused via hash lookup.
+
+### HTTP & networking
+
+- **Connection pooling** — `reqwest::Client` with `pool_max_idle_per_host(64)` and `tcp_nodelay(true)` reuses connections across all requests.
+- **SSE streaming** — Server‑Sent Events parsing with real‑time `on_delta` callbacks for character‑by‑character progress in preview mode.
+
+### HTML processing
+
+- **Custom O(n) tokenizer** — linear‑scan HTML tokenizer (no regex) for performance on large files.
+- **HTML‑aware block splitting** — splits at paragraph boundaries (`</p>`, `</div>`, `</section>`, etc.) to preserve structural context.
+- **Sentence‑aware text splitting** — splits at `.`, `!`, `?`, `\n`, and CJK punctuation boundaries for more natural chunking.
+- **CJK‑aware sizing** — block sizes are divided by `APPROX_CHARS_PER_TOKEN` (4) when Han characters are detected, matching tokenizer density.
+
+### Memory & safety
+
+- **`Arc<str>`** for shared HTML content — avoids cloning large strings.
+- **`String::with_capacity`** pre‑allocation throughout the pipeline.
+- **`AtomicBool` concurrency guard** with `compare_exchange` + RAII guard prevents multiple simultaneous translations.
+- **Environment variable tuning** — all critical parameters (concurrency, block sizes, output tokens) are overridable at runtime.
+
 ## Multithreaded EPUB translation logic
 
-The full‑book flow uses a **producer‑consumer** pattern:
+The full‑book flow uses the **producer‑consumer** pattern described above:
 
-1. **Async producer (translation)**
-   - Takes indices of HTML chapters.
-   - Translates in parallel with dynamic concurrency.
-   - Sends results to a channel as `(index, translated_html)`.
+1. **Async producer (translation)** — takes indices of HTML chapters, translates in parallel with dynamic concurrency, sends results to a channel as `(index, translated_html)`.
 
-2. **Dedicated consumer (writer thread)**
-   - A separate thread handles ZIP writing.
-   - Receives out‑of‑order results and buffers them.
-   - Writes to the ZIP only when the `expected_index` arrives.
-   - Guarantees the correct order in the output EPUB.
+2. **Dedicated consumer (writer thread)** — a separate OS thread handles ZIP writing, receives out‑of‑order results and buffers them, writes to the ZIP only when the `expected_index` arrives, guaranteeing correct output order.
 
-3. **Safe fallback**
-   - If a chapter fails, the original HTML can be kept to avoid truncation.
-   - If the channel closes unexpectedly, the writer still produces a complete EPUB.
+3. **Safe fallback** — if a chapter fails, the original HTML is kept; if the channel closes unexpectedly, the writer still produces a complete EPUB.
 
 ## Translation logic and quality control
 
