@@ -1274,10 +1274,20 @@ async fn translate_html_in_blocks(
     // Para texto CJK reduce los bloques proporcionalmente: cada Han ≈ 1 token,
     // mientras que el alfabeto latino ≈ 4 chars/token. Mantiene el mismo
     // presupuesto de tokens por bloque en ambos casos y evita truncamientos.
+    // IMPORTANTE: los floors del .max() deben ser proporcionales al divisor CJK;
+    // de lo contrario anulan la reducción y se siguen enviando bloques de 8000 chars
+    // que generan TRUNCATED_BY_LENGTH al traducirse al español (expansión 2-4x).
     let block_divisor = if ai::is_mostly_cjk(html) { APPROX_CHARS_PER_TOKEN } else { 1 };
-    let block_min = (options.full_block_min_chars / block_divisor).max(3_000);
-    let block_target = (options.full_block_target_chars / block_divisor).max(5_000);
-    let block_max = (options.full_block_max_chars / block_divisor).max(8_000);
+    let (min_floor, target_floor, max_floor) = if block_divisor > 1 {
+        // CJK: cada char ≈ 1 token de entrada; la traducción al español expande 2-4x,
+        // así que 2000 chars → ~4000-8000 tokens de salida (dentro del cap de 12288).
+        (400, 800, 2_000)
+    } else {
+        (3_000, 5_000, 8_000)
+    };
+    let block_min    = (options.full_block_min_chars    / block_divisor).max(min_floor);
+    let block_target = (options.full_block_target_chars / block_divisor).max(target_floor);
+    let block_max    = (options.full_block_max_chars    / block_divisor).max(max_floor);
 
     let blocks = split_html_into_blocks(
         &tokens,

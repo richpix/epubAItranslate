@@ -496,11 +496,18 @@ fn validate_translation_output(source: &str, translated: &str) -> Result<(), Str
         .count();
 
     if source_content_len >= MIN_CONTENT_CHARS_FOR_RATIO_CHECK {
-        if translated_content_len * 3 < source_content_len {
+        // Para CJK→español: 1 Han ≈ 1 token de entrada pero puede expandirse a
+        // 5-10 chars en español. Usamos un ratio más amplio para evitar rechazar
+        // traducciones válidas (p.ej. 500 chars chinos → 2500+ chars en español).
+        let is_cjk_source = is_mostly_cjk(source_trimmed);
+        let max_expansion = if is_cjk_source { 20 } else { 6 };
+        let min_ratio_divisor = if is_cjk_source { 6 } else { 3 };
+
+        if translated_content_len * min_ratio_divisor < source_content_len {
             return Err("DeepSeek devolvio una traduccion demasiado corta".to_string());
         }
 
-        if translated_content_len > source_content_len * 6 {
+        if translated_content_len > source_content_len * max_expansion {
             return Err("DeepSeek devolvio una traduccion demasiado extensa".to_string());
         }
     }
@@ -882,10 +889,15 @@ fn resolve_max_output_tokens(text: &str) -> usize {
     }
 
     let chars = text.chars().count();
-    // Ajusta la ratio según densidad CJK: caracteres Han ≈ 1 token,
-    // la traducción al español expande y necesita más tokens de salida.
-    let ratio_num: usize = if is_mostly_cjk(text) { 11 } else { 7 };
-    let estimated = (chars * ratio_num) / 20 + 256;
+    // Ajusta la ratio según densidad CJK: 1 Han ≈ 1 token de entrada,
+    // pero la traducción al español puede expandir 2-4x en tokens de salida.
+    // Usamos ratio 3/2 para CJK (expansión agresiva) vs 7/20 para latino.
+    let estimated = if is_mostly_cjk(text) {
+        // CJK: estimado = chars * 3 / 2 + 512 (cubre expansión al español)
+        (chars * 3 / 2).saturating_add(512)
+    } else {
+        (chars * 7) / 20 + 256
+    };
     estimated.clamp(MIN_OUTPUT_TOKENS, DEFAULT_OUTPUT_TOKENS_CAP)
 }
 
