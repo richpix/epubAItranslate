@@ -31,15 +31,20 @@ const LANGUAGE_OPTIONS: LanguageOption[] = [
   { code: "es", label: "Español" },
 ];
 
+const SOURCE_LANGUAGE_OPTIONS: LanguageOption[] = [
+  { code: "zh", label: "Chino" },
+  { code: "ja", label: "Japonés" },
+  { code: "ko", label: "Coreano" },
+  { code: "en", label: "Inglés" },
+];
+
 // Función auxiliar para generar la ruta de salida por defecto basada en el idioma de destino
-function defaultOutputPath(inputPath: string, lang: string): string {
+function defaultOutputPath(inputPath: string, sourceLang: string, targetLang: string): string {
   const lower = inputPath.toLowerCase();
-// Si el archivo de entrada no es un epub válido retorna un sufijo simple
   if (!lower.endsWith(".epub")) {
-    return `${inputPath}_${lang}.epub`;
+    return `${inputPath}_${sourceLang}_${targetLang}.epub`;
   }
-// Devuelve la ruta eliminando la extensión y añadiendo el sufijo de idioma
-  return `${inputPath.slice(0, -5)}_${lang}.epub`;
+  return `${inputPath.slice(0, -5)}_${sourceLang}_${targetLang}.epub`;
 }
 
 // Componente principal para el panel de traducción
@@ -57,6 +62,7 @@ export function TranslationPanel({
 // Estados locales para la ruta de entrada, salida y el idioma a traducir
   const [inputPath, setInputPath] = useState("");
   const [outputPath, setOutputPath] = useState("");
+  const [sourceLanguage, setSourceLanguage] = useState("en");
   const [targetLanguage, setTargetLanguage] = useState("es");
 // Estados misceláneos de la IU
   const [isTranslating, setIsTranslating] = useState(false);
@@ -85,7 +91,7 @@ export function TranslationPanel({
     }
 
     setInputPath(selected);
-    setOutputPath(defaultOutputPath(selected, targetLanguage));
+    setOutputPath(defaultOutputPath(selected, sourceLanguage, targetLanguage));
     setError(null);
     setSuccessMessage(null);
   };
@@ -93,7 +99,7 @@ export function TranslationPanel({
 // Abre un selector de archivos nativo para guardar el archivo traducido
   const pickOutputEpub = async () => {
     const selected = await save({
-      defaultPath: outputPath || defaultOutputPath(inputPath || "translated", targetLanguage),
+      defaultPath: outputPath || defaultOutputPath(inputPath || "translated", sourceLanguage, targetLanguage),
       filters: [{ name: "EPUB", extensions: ["epub"] }],
     });
 
@@ -147,6 +153,7 @@ export function TranslationPanel({
         request: {
           inputPath,
           outputPath,
+          sourceLanguage,
           targetLanguage,
           previewOnly: false,
           apiKey: aiConfig?.apiKey ?? "",
@@ -180,7 +187,32 @@ export function TranslationPanel({
         <p className="text-sm text-slate-600">{t("translation.description")}</p>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="space-y-2">
+          <label className="text-sm font-medium text-slate-700" htmlFor="source-language-select">
+            {t("translation.sourceLanguage")}
+          </label>
+          <select
+            id="source-language-select"
+            className="w-full border border-slate-300 rounded-md px-3 py-2 text-slate-900 bg-white"
+            value={sourceLanguage}
+            onChange={(event) => {
+              const nextLanguage = event.target.value;
+              setSourceLanguage(nextLanguage);
+              if (inputPath) {
+                setOutputPath(defaultOutputPath(inputPath, nextLanguage, targetLanguage));
+              }
+            }}
+            disabled={isTranslating}
+          >
+            {SOURCE_LANGUAGE_OPTIONS.map((option) => (
+              <option key={option.code} value={option.code}>
+                {t(`translation.sourceLanguages.${option.code}`)}
+              </option>
+            ))}
+          </select>
+        </div>
+
         <div className="space-y-2">
           <label className="text-sm font-medium text-slate-700" htmlFor="target-language-select">
             {t("translation.targetLanguage")}
@@ -193,7 +225,7 @@ export function TranslationPanel({
               const nextLanguage = event.target.value;
               setTargetLanguage(nextLanguage);
               if (inputPath) {
-                setOutputPath(defaultOutputPath(inputPath, nextLanguage));
+                setOutputPath(defaultOutputPath(inputPath, sourceLanguage, nextLanguage));
               }
             }}
             disabled={isTranslating}

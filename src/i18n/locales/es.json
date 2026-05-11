@@ -26,8 +26,15 @@
   "translation": {
     "title": "Traducir EPUB",
     "description": "Selecciona un .epub, elige idioma y exporta el archivo traducido.",
+    "sourceLanguage": "Idioma de origen",
     "targetLanguage": "Idioma de destino",
     "moreLanguagesSoon": "Elige el idioma de salida o manténlo en español.",
+    "sourceLanguages": {
+      "zh": "Chino",
+      "ja": "Japonés",
+      "ko": "Coreano",
+      "en": "Inglés"
+    },
     "mode": "Modo de traducción",
     "fullMode": "Libro completo",
     "fullModeHint": "Traduce el libro completo capítulo por capítulo.",

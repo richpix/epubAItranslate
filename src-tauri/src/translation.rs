@@ -19,15 +19,8 @@ use zip::{ZipArchive, ZipWriter};
 use crate::ai;
 
 const APPROX_CHARS_PER_PAGE: usize = 1800;
-const APPROX_CHARS_PER_TOKEN: usize = 4;
 const DEFAULT_PREVIEW_PAGES: usize = 5;
 const CHAPTER_TOKEN_THRESHOLD: usize = 10_000;
-const CHUNK_MIN_CHARS: usize = 2_000;
-const CHUNK_TARGET_CHARS: usize = 3_000;
-const CHUNK_MAX_CHARS: usize = 4_000;
-const FULL_HTML_BLOCK_MIN_CHARS: usize = 12_000;
-const FULL_HTML_BLOCK_TARGET_CHARS: usize = 16_000;
-const FULL_HTML_BLOCK_MAX_CHARS: usize = 20_000;
 const RECOVERY_BLOCK_MIN_CHARS: usize = 6_000;
 const RECOVERY_BLOCK_TARGET_CHARS: usize = 10_000;
 const RECOVERY_BLOCK_MAX_CHARS: usize = 14_000;
@@ -55,6 +48,7 @@ static BLOCK_TRANSLATION_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collec
 pub struct TranslateEpubRequest {
     pub input_path: String,
     pub output_path: String,
+    pub source_language: String,
     pub target_language: String,
     pub api_key: String,
     pub provider: String,
@@ -100,6 +94,7 @@ struct HtmlToken {
 struct TranslationChunkOptions {
     provider: String,
     model: String,
+    source_language: String,
     enable_chunking: bool,
     chunk_threshold_chars: usize,
     chunk_min_chars: usize,
@@ -112,6 +107,80 @@ struct TranslationChunkOptions {
     full_block_target_chars: usize,
     full_block_max_chars: usize,
     force_text_node_mode: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SourceLanguageConfig {
+    chars_per_token: usize,
+    full_block_min_chars: usize,
+    full_block_target_chars: usize,
+    full_block_max_chars: usize,
+    chunk_min_chars: usize,
+    chunk_target_chars: usize,
+    chunk_max_chars: usize,
+    block_min_floor: usize,
+    block_target_floor: usize,
+    block_max_floor: usize,
+    block_divisor: usize,
+}
+
+impl SourceLanguageConfig {
+    fn for_code(code: &str) -> Self {
+        match code {
+            "zh" => Self {
+                chars_per_token: 1,
+                full_block_min_chars: 3_000,
+                full_block_target_chars: 4_000,
+                full_block_max_chars: 5_000,
+                chunk_min_chars: 1_200,
+                chunk_target_chars: 1_800,
+                chunk_max_chars: 2_500,
+                block_min_floor: 400,
+                block_target_floor: 800,
+                block_max_floor: 2_000,
+                block_divisor: 4,
+            },
+            "ja" => Self {
+                chars_per_token: 1,
+                full_block_min_chars: 4_000,
+                full_block_target_chars: 5_500,
+                full_block_max_chars: 7_000,
+                chunk_min_chars: 1_600,
+                chunk_target_chars: 2_400,
+                chunk_max_chars: 3_200,
+                block_min_floor: 600,
+                block_target_floor: 1_200,
+                block_max_floor: 2_500,
+                block_divisor: 3,
+            },
+            "ko" => Self {
+                chars_per_token: 2,
+                full_block_min_chars: 5_000,
+                full_block_target_chars: 7_000,
+                full_block_max_chars: 9_000,
+                chunk_min_chars: 1_800,
+                chunk_target_chars: 2_600,
+                chunk_max_chars: 3_500,
+                block_min_floor: 800,
+                block_target_floor: 1_500,
+                block_max_floor: 3_000,
+                block_divisor: 2,
+            },
+            _ => Self {
+                chars_per_token: 4,
+                full_block_min_chars: 12_000,
+                full_block_target_chars: 16_000,
+                full_block_max_chars: 20_000,
+                chunk_min_chars: 2_000,
+                chunk_target_chars: 3_000,
+                chunk_max_chars: 4_000,
+                block_min_floor: 3_000,
+                block_target_floor: 5_000,
+                block_max_floor: 8_000,
+                block_divisor: 1,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -271,21 +340,23 @@ pub async fn translate_epub(
         .max(1);
     let preview_limit = preview_pages * APPROX_CHARS_PER_PAGE;
 
+    let source_lang_config = SourceLanguageConfig::for_code(request.source_language.as_str());
+
     let configured_max_concurrency = if request.preview_only {
         1
     } else {
         read_env_usize(MAX_CONCURRENCY_ENV, DEFAULT_MAX_CONCURRENT_REQUESTS, 1, 16)
     };
     let mut full_block_min_chars =
-        read_env_usize(FULL_BLOCK_MIN_ENV, FULL_HTML_BLOCK_MIN_CHARS, 8_000, 120_000);
+        read_env_usize(FULL_BLOCK_MIN_ENV, source_lang_config.full_block_min_chars, 8_000, 120_000);
     let mut full_block_target_chars = read_env_usize(
         FULL_BLOCK_TARGET_ENV,
-        FULL_HTML_BLOCK_TARGET_CHARS,
+        source_lang_config.full_block_target_chars,
         8_000,
         120_000,
     );
     let mut full_block_max_chars =
-        read_env_usize(FULL_BLOCK_MAX_ENV, FULL_HTML_BLOCK_MAX_CHARS, 8_000, 120_000);
+        read_env_usize(FULL_BLOCK_MAX_ENV, source_lang_config.full_block_max_chars, 8_000, 120_000);
 
     if full_block_min_chars > full_block_max_chars {
         std::mem::swap(&mut full_block_min_chars, &mut full_block_max_chars);
@@ -296,11 +367,12 @@ pub async fn translate_epub(
     let chunk_options = TranslationChunkOptions {
         provider: request.provider.clone(),
         model: request.model.clone(),
+        source_language: request.source_language.clone(),
         enable_chunking: !request.preview_only,
-        chunk_threshold_chars: CHAPTER_TOKEN_THRESHOLD * APPROX_CHARS_PER_TOKEN,
-        chunk_min_chars: CHUNK_MIN_CHARS,
-        chunk_target_chars: CHUNK_TARGET_CHARS,
-        max_chunk_chars: CHUNK_MAX_CHARS,
+        chunk_threshold_chars: CHAPTER_TOKEN_THRESHOLD * source_lang_config.chars_per_token,
+        chunk_min_chars: source_lang_config.chunk_min_chars,
+        chunk_target_chars: source_lang_config.chunk_target_chars,
+        max_chunk_chars: source_lang_config.chunk_max_chars,
         enable_streaming: request.preview_only,
         max_concurrent_requests: configured_max_concurrency,
         dynamic_rate_limit: !request.preview_only,
@@ -1173,14 +1245,7 @@ async fn translate_html_content(
     let mut skip_tag_depth = 0usize;
     let mut budget_exhausted = false;
     let total_text_chars = count_translatable_text_chars(&tokens);
-    // Ajusta el umbral de chunking para CJK: caracteres Han ≈ 1 token
-    // en lugar de ≈ 4 (alfabeto latino). Así el chunking arranca a ~10K
-    // tokens reales en ambos casos.
-    let effective_chunk_threshold = if ai::is_mostly_cjk(html) {
-        CHAPTER_TOKEN_THRESHOLD
-    } else {
-        options.chunk_threshold_chars
-    };
+    let effective_chunk_threshold = options.chunk_threshold_chars;
     let enable_chunking = options.enable_chunking && total_text_chars > effective_chunk_threshold;
     let progress_label = if let Some(active_reporter) = reporter {
         format!("Traduciendo {}", active_reporter.file_name)
@@ -1271,20 +1336,11 @@ async fn translate_html_in_blocks(
         return Ok((html.to_string(), 0));
     }
 
-    // Para texto CJK reduce los bloques proporcionalmente: cada Han ≈ 1 token,
-    // mientras que el alfabeto latino ≈ 4 chars/token. Mantiene el mismo
-    // presupuesto de tokens por bloque en ambos casos y evita truncamientos.
-    // IMPORTANTE: los floors del .max() deben ser proporcionales al divisor CJK;
-    // de lo contrario anulan la reducción y se siguen enviando bloques de 8000 chars
-    // que generan TRUNCATED_BY_LENGTH al traducirse al español (expansión 2-4x).
-    let block_divisor = if ai::is_mostly_cjk(html) { APPROX_CHARS_PER_TOKEN } else { 1 };
-    let (min_floor, target_floor, max_floor) = if block_divisor > 1 {
-        // CJK: cada char ≈ 1 token de entrada; la traducción al español expande 2-4x,
-        // así que 2000 chars → ~4000-8000 tokens de salida (dentro del cap de 12288).
-        (400, 800, 2_000)
-    } else {
-        (3_000, 5_000, 8_000)
-    };
+    let block_lang_config = SourceLanguageConfig::for_code(&options.source_language);
+    let block_divisor = block_lang_config.block_divisor;
+    let min_floor = block_lang_config.block_min_floor;
+    let target_floor = block_lang_config.block_target_floor;
+    let max_floor = block_lang_config.block_max_floor;
     let block_min    = (options.full_block_min_chars    / block_divisor).max(min_floor);
     let block_target = (options.full_block_target_chars / block_divisor).max(target_floor);
     let block_max    = (options.full_block_max_chars    / block_divisor).max(max_floor);
@@ -1321,6 +1377,7 @@ async fn translate_html_in_blocks(
         let client_cloned = client.clone();
         let api_key_cloned = api_key.to_string();
         let target_lang_cloned = target_language.to_string();
+        let source_lang_cloned = options.source_language.clone();
         let semaphore_cloned = semaphore.clone();
         
         futures.push(async move {
@@ -1335,6 +1392,7 @@ async fn translate_html_in_blocks(
                 options.provider.as_str(),
                 options.model.as_str(),
                 &target_lang_cloned,
+                &source_lang_cloned,
                 block.as_str(),
             ).await;
 
@@ -1395,6 +1453,7 @@ async fn translate_block_with_adaptive_splitting(
     provider: &str,
     model: &str,
     target_language: &str,
+    source_language: &str,
     block_html: &str,
 ) -> Result<String, String> {
     let mut pending_segments: VecDeque<(String, u8)> = VecDeque::new();
@@ -1408,6 +1467,7 @@ async fn translate_block_with_adaptive_splitting(
             provider,
             model,
             target_language,
+            source_language,
             segment.as_str(),
             MAX_RETRIES,
         )
@@ -1442,6 +1502,7 @@ async fn translate_block_with_adaptive_splitting(
                             provider,
                             model,
                             target_language,
+                            source_language,
                             segment.as_str(),
                         )
                         .await?;
@@ -1487,11 +1548,13 @@ async fn translate_block_with_text_node_recovery(
     provider: &str,
     model: &str,
     target_language: &str,
+    source_language: &str,
     block_html: &str,
 ) -> Result<String, String> {
     let recovery_options = TranslationChunkOptions {
         provider: provider.to_string(),
         model: model.to_string(),
+        source_language: source_language.to_string(),
         enable_chunking: true,
         chunk_threshold_chars: 1,
         chunk_min_chars: TRUNCATION_RECOVERY_CHUNK_MIN_CHARS,
@@ -1765,13 +1828,14 @@ async fn translate_text(
             provider,
             model,
             target_language,
+            &options.source_language,
             text,
             MAX_RETRIES,
             on_delta,
         )
         .await
     } else {
-        ai::translate_text_with_retry(client, api_key, provider, model, target_language, text, MAX_RETRIES).await
+        ai::translate_text_with_retry(client, api_key, provider, model, target_language, &options.source_language, text, MAX_RETRIES).await
     }
 }
 

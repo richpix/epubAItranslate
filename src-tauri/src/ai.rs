@@ -96,6 +96,7 @@ pub async fn translate_text_with_retry(
     provider: &str,
     model: &str,
     target_language: &str,
+    source_language: &str,
     text: &str,
     max_retries: u32,
 ) -> Result<String, String> {
@@ -104,7 +105,7 @@ pub async fn translate_text_with_retry(
     let sanitized_api_key = api_key.trim();
 
     loop {
-        match translate_text_once(client, sanitized_api_key, provider, model, target_language, text).await {
+        match translate_text_once(client, sanitized_api_key, provider, model, target_language, source_language, text).await {
             Ok(translated) => {
                 if should_retry_for_han(target_language, &translated) {
                     match translate_text_once_strict_spanish(
@@ -113,6 +114,7 @@ pub async fn translate_text_with_retry(
                         provider,
                         model,
                         target_language,
+                        source_language,
                         text,
                     )
                     .await
@@ -155,6 +157,7 @@ pub async fn translate_text_with_retry_streaming(
     provider: &str,
     model: &str,
     target_language: &str,
+    source_language: &str,
     text: &str,
     max_retries: u32,
     on_delta: Option<&mut (dyn FnMut(&str) + Send)>,
@@ -171,6 +174,7 @@ pub async fn translate_text_with_retry_streaming(
                 provider,
                 model,
                 target_language,
+                source_language,
                 text,
                 Some(on_delta),
             )
@@ -201,6 +205,7 @@ pub async fn translate_text_with_retry_streaming(
             provider,
             model,
             target_language,
+            source_language,
             text,
             None,
         )
@@ -233,6 +238,7 @@ async fn translate_text_once(
     provider: &str,
     model: &str,
     target_language: &str,
+    source_language: &str,
     text: &str,
 ) -> Result<String, String> {
     if text.trim().is_empty() {
@@ -241,7 +247,7 @@ async fn translate_text_once(
 
     let provider_norm = normalize_provider(provider);
     let model_norm = normalize_model(provider_norm.as_str(), model);
-    let system_prompt = get_system_prompt(target_language);
+    let system_prompt = get_system_prompt(target_language, source_language);
     let max_tokens = resolve_max_output_tokens(text);
 
     if provider_norm == "gemini" {
@@ -311,6 +317,7 @@ async fn translate_text_streaming_once(
     provider: &str,
     model: &str,
     target_language: &str,
+    source_language: &str,
     text: &str,
     mut on_delta: Option<&mut (dyn FnMut(&str) + Send)>,
 ) -> Result<String, String> {
@@ -320,7 +327,7 @@ async fn translate_text_streaming_once(
 
     let provider_norm = normalize_provider(provider);
     let model_norm = normalize_model(provider_norm.as_str(), model);
-    let system_prompt = get_system_prompt(target_language);
+    let system_prompt = get_system_prompt(target_language, source_language);
     let max_tokens = resolve_max_output_tokens(text);
 
     if provider_norm == "gemini" {
@@ -541,22 +548,31 @@ fn has_tag_like_fragment(input: &str) -> bool {
 
 // Retorna un prompt estándar o extraído del caché interno si ya existe para este idioma.
 // Dicta explícitamente el rol, tono narrativo y tratamiento de formato HTML al modelo.
-fn get_system_prompt(target_language: &str) -> String {
+fn get_system_prompt(target_language: &str, source_language: &str) -> String {
+    let cache_key = format!("{}_{}", source_language, target_language);
     let cache = SYSTEM_PROMPT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache_guard = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    if let Some(prompt) = cache_guard.get(target_language) {
+    if let Some(prompt) = cache_guard.get(&cache_key) {
         return prompt.clone();
     }
 
+    let source_hint = match source_language {
+        "zh" => " El texto origen esta en chino. Traduce al espanol manteniendo nombres propios en pinyin si corresponde.",
+        "ja" => " El texto origen esta en japones. Respeta honorificos (-san, -sama, -kun, -sensei) y conserva nombres propios en romaji.",
+        "ko" => " El texto origen esta en coreano. Usa romanizacion revisada para nombres propios cuando sea necesario.",
+        _ => "",
+    };
+
     let prompt = format!(
-        "Eres un traductor literario profesional. Traduce al {} con calidad editorial y naturalidad, como una traduccion humana cuidada. Reglas obligatorias: 1) No resumas ni omitas informacion. 2) No agregues explicaciones, notas ni encabezados. 3) Conserva el tono narrativo, estilo y matices. 4) Si aparecen etiquetas HTML/XML, no las modifiques ni las traduzcas. 5) Si aparecen entidades HTML (por ejemplo &amp;, &lt;, &gt;), conservaalas. 6) Respeta saltos de linea. Devuelve unicamente el texto traducido.",
-        target_language
+        "Eres un traductor literario profesional. Traduce al {} con calidad editorial y naturalidad, como una traduccion humana cuidada.{} Reglas obligatorias: 1) No resumas ni omitas informacion. 2) No agregues explicaciones, notas ni encabezados. 3) Conserva el tono narrativo, estilo y matices. 4) Si aparecen etiquetas HTML/XML, no las modifiques ni las traduzcas. 5) Si aparecen entidades HTML (por ejemplo &amp;, &lt;, &gt;), conservaalas. 6) Respeta saltos de linea. Devuelve unicamente el texto traducido.",
+        target_language,
+        source_hint
     );
 
-    cache_guard.insert(target_language.to_string(), prompt.clone());
+    cache_guard.insert(cache_key, prompt.clone());
     prompt
 }
 
@@ -569,6 +585,7 @@ async fn translate_text_once_strict_spanish(
     provider: &str,
     model: &str,
     target_language: &str,
+    source_language: &str,
     text: &str,
 ) -> Result<String, String> {
     if text.trim().is_empty() {
@@ -577,7 +594,7 @@ async fn translate_text_once_strict_spanish(
 
     let strict_prompt = format!(
         "{} IMPORTANTE: Responde SOLO en {}. NO uses chino simplificado ni tradicional. Si no sabes un termino, transliteralo o dejalo en el idioma original, pero nunca chino.",
-        get_system_prompt(target_language),
+        get_system_prompt(target_language, source_language),
         target_language
     );
 
