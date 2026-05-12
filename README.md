@@ -179,25 +179,26 @@ The application requires an API key from one of the supported AI providers (Deep
 ### Prerequisites
 
 - Node.js 18+
+- pnpm (install with `npm i -g pnpm` or via [corepack](https://nodejs.org/api/corepack.html))
 - Stable Rust toolchain
 - Tauri system dependencies (see [Tauri docs](https://tauri.app/start/prerequisites/))
 
 ### Install dependencies
 
 ```bash
-npm install
+pnpm install
 ```
 
 ### Run in development mode
 
 ```bash
-npm run tauri dev
+pnpm tauri dev
 ```
 
 ### Production build
 
 ```bash
-npm run tauri build
+pnpm tauri build
 ```
 
 ### Backend Rust check

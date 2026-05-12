@@ -171,25 +171,26 @@ La aplicación requiere una clave de API de uno de los proveedores de IA soporta
 ### Prerrequisitos
 
 - Node.js 18+
+- pnpm (instalar con `npm i -g pnpm` o mediante [corepack](https://nodejs.org/api/corepack.html))
 - Rust toolchain estable
 - Dependencias de sistema de Tauri (ver [documentación de Tauri](https://tauri.app/start/prerequisites/))
 
 ### Instalar dependencias
 
 ```bash
-npm install
+pnpm install
 ```
 
 ### Ejecutar en modo desarrollo
 
 ```bash
-npm run tauri dev
+pnpm tauri dev
 ```
 
 ### Compilación para producción
 
 ```bash
-npm run tauri build
+pnpm tauri build
 ```
 
 ### Verificación del backend Rust
