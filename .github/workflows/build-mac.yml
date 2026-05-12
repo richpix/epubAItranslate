@@ -19,15 +19,25 @@ jobs:
           - aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
+
+      # ✅ Fix 1: pnpm primero, con packageManager explícito
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.1
+          run_install: false
+
+      # ✅ Fix 2: Node 22 (LTS estable, compatible con Node 24 runtime)
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'pnpm'
-      - run: corepack enable
+
       - run: pnpm install
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -39,16 +49,25 @@ jobs:
           args: '--target ${{ matrix.target }}'
 
   build-windows:
-    runs-on: windows-latest
+    # ✅ Fix 3: runner explícito para evitar redirecciones inesperadas
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.1
+          run_install: false
+
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'pnpm'
-      - run: corepack enable
+
       - run: pnpm install
+
       - uses: dtolnay/rust-toolchain@stable
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -59,20 +78,30 @@ jobs:
           prerelease: false
 
   build-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.1
+          run_install: false
+
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'pnpm'
-      - run: corepack enable
+
       - run: pnpm install
+
       - name: Instalar dependencias de sistema
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
       - uses: dtolnay/rust-toolchain@stable
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
